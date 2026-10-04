@@ -12,7 +12,7 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Codex Proxy Launcher")]
 [assembly: System.Reflection.AssemblyDescription("Local proxy launcher for Codex; independent community utility")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.0.3.0")]
 
 namespace CodexProxyLauncher
 {
@@ -76,7 +76,7 @@ namespace CodexProxyLauncher
             logs = MakeButton("打开日志", 547, 437, 130);
             var restore = new LinkLabel { Text = "撤销工具配置", AutoSize = true, Location = new Point(31, 503),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left, LinkColor = Color.FromArgb(95, 108, 128) };
-            var note = new Label { Text = "本地独立工具  v1.0  ·  配置与日志保存在软件目录", AutoSize = true,
+            var note = new Label { Text = "本地独立工具  v1.0.3  ·  配置与日志保存在软件目录", AutoSize = true,
                 Location = new Point(322, 503), ForeColor = Color.FromArgb(120, 130, 145),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
             Controls.AddRange(new Control[] {title, caption, status, progress, details, start, diagnose, settings, logs, restore, note});
