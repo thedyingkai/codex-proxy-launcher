@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -20,95 +19,6 @@ spec.loader.exec_module(b)
 
 
 class LocalWorkTests(unittest.TestCase):
-    def test_native_revision_requires_one_restart(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)
-            proxy='http://127.0.0.1:7890'
-            proc={'ProcessId':77,'Created':'same-start','ExecutablePath':'app.exe','CommandLine':'app.exe --proxy-server='+proxy}
-            saved={'pid':77,'created':'same-start','exe':'app.exe','proxy':proxy,'launcher_version':'1.0.2','bundled_plugins_resources':None}
-            with patch.object(b,'STATE',root):
-                b.write_json(root/'last-launch.json',saved)
-                self.assertEqual(b.prior_launch_matches([proc],proxy),77)
-                self.assertIsNone(b.prior_launch_matches([proc],proxy,native_tools=True))
-                saved['native_proxy_revision']=b.NATIVE_PROXY_REVISION
-                b.write_json(root/'last-launch.json',saved)
-                self.assertEqual(b.prior_launch_matches([proc],proxy,native_tools=True),77)
-
-    def test_native_guardian_repairs_regeneration_and_stops(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)
-            (root/'config.toml').write_text('model = "keep"\n')
-            code=('import importlib.util,sys; from pathlib import Path; '
-                  'spec=importlib.util.spec_from_file_location("b",sys.argv[1]); '
-                  'b=importlib.util.module_from_spec(spec); spec.loader.exec_module(b); '
-                  'root=Path(sys.argv[2]); b.STATE=root/"state"; b.codex_home=lambda:root; '
-                  'b.load_settings=lambda:{"proxy_mode":"manual","proxy_url":"http://127.0.0.1:7890"}; '
-                  'b.log=lambda message:None; sys.exit(b.watch_native_proxy(int(sys.argv[3])))')
-            child=subprocess.Popen([sys.executable,'-I','-c',code,str(Path(b.__file__).resolve()),str(root),str(os.getpid())],
-                                   stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-                                   creationflags=b.HIDDEN)
-            def wait_config():
-                deadline=time.monotonic()+8
-                while time.monotonic()<deadline:
-                    value=tomllib.loads((root/'config.toml').read_text())
-                    if b.native_proxy_status(value,'http://127.0.0.1:7890')['configured']:
-                        return value
-                    time.sleep(.05)
-                self.fail('guardian did not restore the proxy overlay')
-            try:
-                self.assertEqual(wait_config()['model'],'keep')
-                (root/'config.toml').write_text('model = "keep"\n[features]\nbrowser_use = true\n')
-                self.assertTrue(wait_config()['features']['browser_use'])
-                (root/'state/native-guardian.stop').write_text('stop')
-                self.assertEqual(child.wait(timeout=3),0)
-            finally:
-                if child.poll() is None:
-                    child.terminate();child.wait(timeout=3)
-
-    def test_native_proxy_overlay_preserves_config_and_is_idempotent(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)
-            original='model = "existing"\n[mcp_servers.cua_repl]\nenabled = false\ncommand = "app.exe"\n'
-            (root/'config.toml').write_text(original,encoding='utf-8')
-            with patch.object(b,'codex_home',return_value=root),patch.object(b,'STATE',root/'state'),patch.object(b,'log'):
-                self.assertTrue(b.update_native_proxy('http://127.0.0.1:7890'))
-                self.assertFalse(b.update_native_proxy('http://127.0.0.1:7890'))
-                conf=tomllib.loads((root/'config.toml').read_text())
-                self.assertEqual(conf['mcp_servers']['cua_repl'],tomllib.loads(original)['mcp_servers']['cua_repl'])
-                self.assertTrue(b.native_proxy_status(conf,'http://127.0.0.1:7890')['configured'])
-                self.assertFalse(b.native_proxy_status(conf,'http://127.0.0.1:7891')['configured'])
-                self.assertNotIn('NODE_REPL_TRUSTED_SERVICES',conf['mcp_servers']['node_repl']['env'])
-                self.assertNotIn('NODE_REPL_REQUEST_META',conf['mcp_servers']['node_repl']['env'])
-                self.assertTrue(b.update_native_proxy('http://127.0.0.1:7891'))
-                self.assertTrue(b.update_native_proxy(restore=True))
-                self.assertEqual(tomllib.loads((root/'config.toml').read_text()),tomllib.loads(original))
-
-    def test_native_proxy_refuses_unrelated_server(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)
-            original='[mcp_servers.node_repl]\ncommand = "my-runtime.exe"\n'
-            (root/'config.toml').write_text(original)
-            with patch.object(b,'codex_home',return_value=root),patch.object(b,'STATE',root/'state'),self.assertRaises(b.LauncherError):
-                b.update_native_proxy('http://127.0.0.1:7890')
-            self.assertEqual((root/'config.toml').read_text(),original)
-
-    def test_native_proxy_repairs_app_regeneration_without_changing_other_tables(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)
-            app=Path('C:/Program Files/WindowsApps/OpenAI.Codex_new/app/ChatGPT.exe')
-            conf={'mcp_servers':{'cua_repl':{'enabled':False,'command':str(app)}}}
-            original='[mcp_servers.cua_repl]\nenabled = false\ncommand = '+json.dumps(str(app))+'\n'
-            (root/'config.toml').write_text(original)
-            with patch.object(b,'codex_home',return_value=root),patch.object(b,'STATE',root/'state'),patch.object(b,'log'),patch.object(b,'app_entry_contains',return_value=True):
-                b.update_native_proxy('http://127.0.0.1:7890')
-                updated=tomllib.loads((root/'config.toml').read_text())
-                self.assertTrue(b.app_manages_tools(updated,app))
-                (root/'config.toml').write_text(original+'\n[features]\nbrowser_use = true\n')
-                self.assertTrue(b.update_native_proxy('http://127.0.0.1:7890'))
-                updated=tomllib.loads((root/'config.toml').read_text())
-                self.assertTrue(updated['features']['browser_use'])
-                self.assertEqual(updated['mcp_servers']['cua_repl'],conf['mcp_servers']['cua_repl'])
-
     def test_per_conversation_tool_config_is_detected_without_version_pin(self):
         app = Path('C:/Program Files/WindowsApps/OpenAI.Codex_any-version/app/ChatGPT.exe')
         config = {'mcp_servers':{'cua_repl':{'enabled':False,'command':str(app)}}}

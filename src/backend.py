@@ -36,10 +36,8 @@ POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/Windo
 ALIAS = "node_repl_proxy"
 NO_PROXY = "localhost,127.0.0.1,::1"
 HIDDEN = subprocess.CREATE_NO_WINDOW
-VERSION = "1.0.3"
+VERSION = "1.0.2"
 BUNDLED_RESOURCES_ENV = "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH"
-NATIVE_SERVER = "node_repl"
-NATIVE_PROXY_REVISION = 1
 
 
 class LauncherError(Exception):
@@ -315,7 +313,7 @@ def supports_bundle_override(resources):
 def app_manages_tools(config, app):
     """New desktop builds generate trusted MCP configuration per conversation."""
     servers = config.get("mcp_servers", {})
-    if isinstance(servers.get("node_repl"), dict) and not owned_native_overlay(servers["node_repl"]):
+    if isinstance(servers.get("node_repl"), dict):
         return False
     disabled = servers.get("cua_repl", {})
     if disabled.get("enabled") is not False:
@@ -515,7 +513,7 @@ def table_path(header):
         return None
 
 
-def replace_alias(text, alias, server_name=ALIAS):
+def replace_alias(text, alias):
     """Edit complete table spans, preserving all unrelated TOML byte text.
 
     Prefix parsing prevents a header-looking line inside a multiline string or
@@ -534,22 +532,22 @@ def replace_alias(text, alias, server_name=ALIAS):
         headers.append((m.start(), path))
     targets = []
     for i, (start, path) in enumerate(headers):
-        if path[:2] == ("mcp_servers", server_name):
+        if path[:2] == ("mcp_servers", ALIAS):
             targets.append((start, headers[i+1][0] if i+1 < len(headers) else len(text)))
-    current = original.get("mcp_servers", {}).get(server_name)
+    current = original.get("mcp_servers", {}).get(ALIAS)
     if current is not None and not targets:
         raise LauncherError("MCP 配置使用了内联表或不支持的表结构，无法安全替换。原文件保持不变。")
     updated = text
     for start, end in reversed(targets):
         updated = updated[:start] + updated[end:]
     if alias is not None:
-        block = "[mcp_servers." + server_name + "]\n"
+        block = "[mcp_servers." + ALIAS + "]\n"
         block += "\n".join(json.dumps(k) + " = " + toml_value(v) for k, v in alias.items()) + "\n"
         updated = updated.rstrip() + "\n\n" + block
     expected = copy.deepcopy(original)
-    expected.setdefault("mcp_servers", {}).pop(server_name, None)
+    expected.setdefault("mcp_servers", {}).pop(ALIAS, None)
     if alias is not None:
-        expected["mcp_servers"][server_name] = alias
+        expected["mcp_servers"][ALIAS] = alias
     actual = tomllib.loads(updated)
     # An otherwise empty table is harmless, but no other semantic change is allowed.
     if expected.get("mcp_servers") == {}:
@@ -564,152 +562,6 @@ def replace_alias(text, alias, server_name=ALIAS):
 def desired_alias(config):
     return {"command": str(PYTHON), "args": ["-I", "-X", "utf8", str(SCRIPT), "mcp"],
             "startup_timeout_sec": 120, "env_vars": managed_env_vars(config)}
-
-
-def owned_native_overlay(server):
-    return isinstance(server, dict) and server.get("command") == str(PYTHON) and server.get("args") == [
-        "-I", "-X", "utf8", str(SCRIPT), "native-placeholder"]
-
-
-def native_overlay(proxy):
-    # A valid, inert transport is necessary for config/read. The desktop supplies
-    # the real command, args, trust metadata and services in each thread config.
-    # Codex merges the env map, so ONLY these network settings are contributed.
-    return {"command": str(PYTHON),
-            "args": ["-I", "-X", "utf8", str(SCRIPT), "native-placeholder"],
-            "startup_timeout_sec": 120, "env": proxy_env(proxy, {})}
-
-
-def native_placeholder():
-    """Empty MCP server for non-desktop clients; never substitutes browser tools."""
-    for line in sys.stdin:
-        try:
-            request = json.loads(line)
-            if "id" not in request:
-                continue
-            method = request.get("method")
-            if method == "initialize":
-                result = {"protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
-                          "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "codex-proxy-environment", "version": VERSION}}
-            elif method == "tools/list":
-                result = {"tools": []}
-            elif method == "ping":
-                result = {}
-            else:
-                print(json.dumps({"jsonrpc": "2.0", "id": request["id"],
-                                  "error": {"code": -32601, "message": "Method not found"}}), flush=True)
-                continue
-            print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
-        except (ValueError, TypeError):
-            continue
-    return 0
-
-
-def update_native_proxy(proxy=None, restore=False):
-    path = codex_home() / "config.toml"
-    rollback = STATE / "native-proxy-before.json"
-    for _ in range(4):
-        original = path.read_bytes()
-        text = original.decode("utf-8-sig")
-        config = tomllib.loads(text)
-        old = config.get("mcp_servers", {}).get(NATIVE_SERVER)
-        if old is not None and not owned_native_overlay(old):
-            # A new official layout or user-defined entry is never overwritten.
-            raise LauncherError("官方工具入口已变化，未覆盖现有 node_repl 配置。请查看诊断。")
-        if restore:
-            if not rollback.exists() or not owned_native_overlay(old):
-                return False
-            saved = json.loads(rollback.read_text(encoding="utf-8"))
-            if saved["config_path"] != str(path):
-                raise LauncherError("代理补充配置的备份属于另一个 Codex 配置文件。")
-            desired = saved["previous_server"]
-        else:
-            desired = copy.deepcopy(old) if old else native_overlay(proxy)
-            desired.setdefault("env", {}).update(proxy_env(proxy, {}))
-        if old == desired:
-            return False
-        updated = replace_alias(text, desired, NATIVE_SERVER)
-        if path.read_bytes() != original:
-            time.sleep(.15)
-            continue
-        STATE.mkdir(parents=True, exist_ok=True)
-        if not restore and not rollback.exists():
-            write_json(rollback, {"config_path": str(path), "previous_server": old, "created": stamp()})
-        backup_dir = STATE / "backups"
-        backup_dir.mkdir(exist_ok=True)
-        (backup_dir / ("native-proxy-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".toml")).write_bytes(original)
-        if path.read_bytes() != original:
-            continue
-        atomic_write(path, updated.encode("utf-8-sig" if original.startswith(b"\xef\xbb\xbf") else "utf-8"))
-        log("Native MCP proxy environment " + ("restored" if restore else "configured") + "; proxy=" + str(proxy))
-        return True
-    raise LauncherError("Codex 正在更新工具配置，代理补充配置将在下次检查时重试。")
-
-
-def native_proxy_status(config, proxy):
-    server = config.get("mcp_servers", {}).get(NATIVE_SERVER)
-    expected = proxy_env(proxy, {})
-    good = owned_native_overlay(server) and all(server.get("env", {}).get(k) == v for k, v in expected.items())
-    return {"configured": good, "browser_session": "not-tested",
-            "meaning": "已补充原生工具代理环境；网页操作仍需实测。" if good else "原生工具缺少代理补充配置。"}
-
-
-def ensure_native_guardian(parent_pid):
-    STATE.mkdir(parents=True, exist_ok=True)
-    (STATE / "native-guardian.stop").unlink(missing_ok=True)
-    child = subprocess.Popen([str(PYTHON), "-I", "-X", "utf8", str(SCRIPT), "watch-native",
-                              "--parent-pid", str(parent_pid)], cwd=ROOT,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             creationflags=HIDDEN, close_fds=True)
-    return child.pid
-
-
-def watch_native_proxy(parent_pid):
-    import msvcrt
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    kernel.OpenProcess.restype = ctypes.c_void_p
-    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-    STATE.mkdir(parents=True, exist_ok=True)
-    with (STATE / "native-guardian.lock").open("a+b") as lock:
-        lock.seek(0); lock.write(b"0"); lock.flush(); lock.seek(0)
-        try:
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
-            return 0
-        handle = kernel.OpenProcess(0x00100000, False, parent_pid)
-        if not handle:
-            return 1
-        try:
-            write_json(STATE / "native-guardian.json", {"pid": os.getpid(), "parent_pid": parent_pid, "started": stamp()})
-            previous_error = None
-            previous_signature = None
-            while kernel.WaitForSingleObject(handle, 250) == 0x102:
-                if (STATE / "native-guardian.stop").exists():
-                    break
-                try:
-                    proxy, _ = choose_proxy(load_settings())
-                    config_path = codex_home() / "config.toml"
-                    info = config_path.stat()
-                    signature = (info.st_mtime_ns, info.st_size, proxy)
-                    if signature == previous_signature:
-                        continue
-                    update_native_proxy(proxy)
-                    info = config_path.stat()
-                    previous_signature = (info.st_mtime_ns, info.st_size, proxy)
-                    previous_error = None
-                except Exception as error:
-                    message = str(error)
-                    if message != previous_error:
-                        log("Native proxy guardian: " + message)
-                        previous_error = message
-            return 0
-        finally:
-            kernel.CloseHandle(handle)
-            lock.seek(0)
-            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def owned_alias(alias):
@@ -850,13 +702,12 @@ def close_app(processes):
     raise LauncherError("Codex 尚未正常退出，可能有保存提示。请处理提示或手动退出后重试；没有强制结束进程。")
 
 
-def prior_launch_matches(processes, proxy, bundled_resources=None, native_tools=False):
+def prior_launch_matches(processes, proxy, bundled_resources=None):
     p = STATE / "last-launch.json"
     if not p.exists():
         return None
     saved = json.loads(p.read_text(encoding="utf-8"))
     if (saved.get("proxy") != proxy or not saved.get("launcher_version")
-            or native_tools and saved.get("native_proxy_revision", 0) < NATIVE_PROXY_REVISION
             or saved.get("bundled_plugins_resources") != bundled_resources):
         return None
     for process in processes:
@@ -870,11 +721,7 @@ def prior_launch_matches(processes, proxy, bundled_resources=None, native_tools=
 def run_action(action):
     settings = load_settings()
     if action == "restore":
-        atomic_write(STATE / "native-guardian.stop", b"stop\n")
-        time.sleep(1.2)
-        native_changed = update_native_proxy(restore=True)
         changed = update_config(restore=True)
-        changed = changed or native_changed
         emit("result", "已恢复启动器安装前的工具配置；其他 Codex 设置保持当前值。" if changed else "工具配置无需恢复。", status="restored")
         return 0
     proxy, source = choose_proxy(settings)
@@ -897,7 +744,7 @@ def run_action(action):
                                 if item["reachable"] else "：连接失败，" + item.get("error", "")))
     try:
         if native_tools:
-            report["mcp"] = {"mode": "app-managed", **native_proxy_status(config, proxy)}
+            report["mcp"] = {"mode": "app-managed", "meaning": "官方工具配置由应用按会话生成，继承主程序代理；不重建其信任或认证设置。"}
         else:
             _, _, _, info = mcp_configuration(settings)
             report["mcp"] = {"mode": "legacy-wrapper", "configuration": info}
@@ -911,13 +758,12 @@ def run_action(action):
         if report["mcp"].get("error"):
             raise LauncherError(report["mcp"]["error"])
         if native_tools:
-            progress(report["mcp"]["meaning"])
+            progress("已识别应用按会话管理的官方工具入口；无需旧版独立代理条目。")
         else:
             progress("正在验证独立官方工具进程的 MCP 初始化握手……")
             report["mcp"]["handshake"] = check_mcp()
         write_json(LOGS / "latest-diagnostics.json", report)
-        partial = (any(not item["reachable"] for item in checks) or report["local_work"]["status"] == "failed"
-                   or native_tools and not report["mcp"]["configured"])
+        partial = any(not item["reachable"] for item in checks) or report["local_work"]["status"] == "failed"
         message = ("部分地址连接失败，请查看日志；官方 MCP 初始化通过。" if partial else "代理连接与官方 MCP 初始化检查通过。")
         if native_tools:
             message = "代理与应用托管工具配置检查已完成。" + report["local_work"]["message"]
@@ -933,21 +779,12 @@ def run_action(action):
         progress("内置插件副本已校验。以后更新时会自动重新识别并准备，无需手动修改版本或路径。")
     progress("正在检查工具代理配置；配置变化前会自动备份……")
     changed = update_config(app_managed=native_tools)
-    if native_tools:
-        native_changed = update_native_proxy(proxy)
-        changed = changed or native_changed
-        progress("已补充原生浏览器工具的代理环境，官方按会话生成的权限与工具入口保持有效。")
-        if processes:
-            ensure_native_guardian(processes[0]["ProcessId"])
-        report["mcp"] = {"mode": "app-managed", **native_proxy_status(
-            tomllib.loads((codex_home() / "config.toml").read_text(encoding="utf-8-sig")), proxy)}
-        write_json(LOGS / "latest-diagnostics.json", report)
     if action == "configure":
         shortcut = install_shortcut()
         emit("result", "已保存代理工具配置并创建桌面“Codex 代理启动”快捷方式。当前 Codex 会话没有重启。", status="configured", shortcut=shortcut, changed=changed)
         return 0
     if processes:
-        matched = prior_launch_matches(processes, proxy, bundle["resources_path"], native_tools=native_tools)
+        matched = prior_launch_matches(processes, proxy, bundle["resources_path"])
         if matched and action != "restart":
             emit("result", "Codex 已通过本启动器运行，代理配置相同。", status="already", pid=matched)
             return 0
@@ -983,10 +820,7 @@ def run_action(action):
     main = next((p for p in candidates if p["ProcessId"] == child.pid), candidates[0])
     write_json(STATE / "last-launch.json", {"time": stamp(), "pid": main["ProcessId"],
               "created": main["Created"], "exe": main["ExecutablePath"], "proxy": proxy,
-              "launcher_version": VERSION, "bundled_plugins_resources": bundle["resources_path"],
-              "native_proxy_revision": NATIVE_PROXY_REVISION if native_tools else 0})
-    if native_tools:
-        ensure_native_guardian(main["ProcessId"])
+              "launcher_version": VERSION, "bundled_plugins_resources": bundle["resources_path"]})
     progress("Codex 已启动，正在读取本次 Local Work 执行器的连接状态……")
     deadline = time.monotonic() + 12
     while True:
@@ -1006,13 +840,8 @@ def run_action(action):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["launch", "restart", "configure", "diagnose", "restore", "mcp", "mcp-config", "native-placeholder", "watch-native"])
-    parser.add_argument("--parent-pid", type=int)
+    parser.add_argument("action", choices=["launch", "restart", "configure", "diagnose", "restore", "mcp", "mcp-config"])
     args = parser.parse_args()
-    if args.action == "native-placeholder":
-        return native_placeholder()
-    if args.action == "watch-native":
-        return watch_native_proxy(args.parent_pid) if args.parent_pid else 2
     if args.action == "mcp":
         return run_mcp()
     if args.action == "mcp-config":
