@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+- Recognize desktop builds that generate trusted tool configuration per conversation, without requiring a persisted node_repl entry.
+- Remove only this launcher's obsolete wrapper on those builds, while retaining the app's native tool and trust settings.
+- Correct diagnostics for this mode and retain already-applied launch settings across a diagnostic-only launcher update.
+- Confirm Local Work connected successfully on the first post-fix startup; add two migration tests (24 tests total).
+
 ## 1.0.1
 
 - Automatically materialize and verify bundled plugin files when Store encryption makes native copying fail during Local Work startup.

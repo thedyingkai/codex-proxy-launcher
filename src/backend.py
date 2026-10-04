@@ -36,7 +36,7 @@ POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/Windo
 ALIAS = "node_repl_proxy"
 NO_PROXY = "localhost,127.0.0.1,::1"
 HIDDEN = subprocess.CREATE_NO_WINDOW
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 BUNDLED_RESOURCES_ENV = "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH"
 
 
@@ -282,7 +282,7 @@ def bundled_plugin_source(app):
     return None
 
 
-def supports_bundle_override(resources):
+def app_entry_contains(resources, markers):
     """Inspect the installed app's own entry scripts, without altering them."""
     try:
         with (resources / "app.asar").open("rb") as stream:
@@ -298,11 +298,31 @@ def supports_bundle_override(resources):
                 if not 0 < size <= 16 * 1024 * 1024:
                     continue
                 stream.seek(8 + header[1] + int(entry["offset"]))
-                if BUNDLED_RESOURCES_ENV.encode() in stream.read(size):
+                content = stream.read(size)
+                if all(marker.encode() in content for marker in markers):
                     return True
     except (OSError, ValueError, KeyError, struct.error):
         pass
     return False
+
+
+def supports_bundle_override(resources):
+    return app_entry_contains(resources, [BUNDLED_RESOURCES_ENV])
+
+
+def app_manages_tools(config, app):
+    """New desktop builds generate trusted MCP configuration per conversation."""
+    servers = config.get("mcp_servers", {})
+    if isinstance(servers.get("node_repl"), dict):
+        return False
+    disabled = servers.get("cua_repl", {})
+    if disabled.get("enabled") is not False:
+        return False
+    if not re.search(r"(?i)[\\/]WindowsApps[\\/]OpenAI\.Codex_[^\\/]+[\\/]app[\\/](ChatGPT|Codex)\.exe$",
+                     str(disabled.get("command", ""))):
+        return False
+    return app_entry_contains(app.parent / "resources",
+                              ["getExpectedThreadConfig", "getTrustedServiceEnv", "mcp_servers.node_repl"])
 
 
 def tree_hashes(root):
@@ -550,7 +570,7 @@ def owned_alias(alias):
             or any(x.endswith("\\src\\backend.py") for x in args) and "mcp" in args)
 
 
-def update_config(restore=False):
+def update_config(restore=False, app_managed=False):
     config_path = codex_home() / "config.toml"
     STATE.mkdir(parents=True, exist_ok=True)
     rollback = STATE / "mcp-before.json"
@@ -559,6 +579,8 @@ def update_config(restore=False):
         text = original.decode("utf-8-sig")
         config = tomllib.loads(text)
         old = config.get("mcp_servers", {}).get(ALIAS)
+        if app_managed and old and (old.get("command") != str(PYTHON) or str(SCRIPT) not in old.get("args", [])):
+            return False  # Never remove another installation's or user's entry.
         if not owned_alias(old):
             raise LauncherError("同名 node_repl_proxy 已被其他工具占用，未覆盖。请检查 config.toml。")
         if restore:
@@ -568,6 +590,8 @@ def update_config(restore=False):
             if prior["config_path"] != str(config_path):
                 raise LauncherError("回退文件对应另一份 Codex 配置，未覆盖当前文件。")
             alias = prior["previous_alias"]
+        elif app_managed:
+            alias = None
         else:
             alias = desired_alias(config)
         if old == alias:
@@ -681,7 +705,7 @@ def prior_launch_matches(processes, proxy, bundled_resources=None):
     if not p.exists():
         return None
     saved = json.loads(p.read_text(encoding="utf-8"))
-    if (saved.get("proxy") != proxy or saved.get("launcher_version") != VERSION
+    if (saved.get("proxy") != proxy or not saved.get("launcher_version")
             or saved.get("bundled_plugins_resources") != bundled_resources):
         return None
     for process in processes:
@@ -711,12 +735,17 @@ def run_action(action):
               "remote_session": "未验证，需要在 Codex 内确认远程设备在线"}
     processes = app_processes()
     report["local_work"] = local_work_status(processes)
+    config = tomllib.loads((codex_home() / "config.toml").read_text(encoding="utf-8-sig"))
+    native_tools = app_manages_tools(config, app)
     for item in checks:
         progress(item["host"] + ("：代理 TLS/HTTP 可达（HTTP " + str(item["http_status"]) + "，不代表已登录）"
                                 if item["reachable"] else "：连接失败，" + item.get("error", "")))
     try:
-        _, _, _, info = mcp_configuration(settings)
-        report["mcp"] = {"configuration": info}
+        if native_tools:
+            report["mcp"] = {"mode": "app-managed", "meaning": "官方工具配置由应用按会话生成，继承主程序代理；不重建其信任或认证设置。"}
+        else:
+            _, _, _, info = mcp_configuration(settings)
+            report["mcp"] = {"mode": "legacy-wrapper", "configuration": info}
     except Exception as error:
         report["mcp"] = {"error": str(error)}
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -726,11 +755,16 @@ def run_action(action):
     if action == "diagnose":
         if report["mcp"].get("error"):
             raise LauncherError(report["mcp"]["error"])
-        progress("正在验证独立官方工具进程的 MCP 初始化握手……")
-        report["mcp"]["handshake"] = check_mcp()
+        if native_tools:
+            progress("已识别应用按会话管理的官方工具入口；无需旧版独立代理条目。")
+        else:
+            progress("正在验证独立官方工具进程的 MCP 初始化握手……")
+            report["mcp"]["handshake"] = check_mcp()
         write_json(LOGS / "latest-diagnostics.json", report)
         partial = any(not item["reachable"] for item in checks) or report["local_work"]["status"] == "failed"
         message = ("部分地址连接失败，请查看日志；官方 MCP 初始化通过。" if partial else "代理连接与官方 MCP 初始化检查通过。")
+        if native_tools:
+            message = "代理与应用托管工具配置检查已完成。" + report["local_work"]["message"]
         if report["local_work"]["status"] == "failed":
             message = "代理与 MCP 检查已完成；" + report["local_work"]["message"]
         emit("result", message + "浏览器、Computer Use 和 Remote 的实际会话需在 Codex 中确认。", status="partial" if partial else "checked", report=report)
@@ -742,7 +776,7 @@ def run_action(action):
     if bundle["resources_path"]:
         progress("内置插件副本已校验。以后更新时会自动重新识别并准备，无需手动修改版本或路径。")
     progress("正在检查工具代理配置；配置变化前会自动备份……")
-    changed = update_config()
+    changed = update_config(app_managed=native_tools)
     if action == "configure":
         shortcut = install_shortcut()
         emit("result", "已保存代理工具配置并创建桌面“Codex 代理启动”快捷方式。当前 Codex 会话没有重启。", status="configured", shortcut=shortcut, changed=changed)

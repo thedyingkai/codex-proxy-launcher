@@ -8,7 +8,7 @@
 
 ## 下载与使用
 
-从 [Releases](https://github.com/thedyingkai/codex-proxy-launcher/releases) 下载 `codex-proxy-launcher-1.0.1-windows-x64.zip`，完整解压后双击 `CodexProxyLauncher.exe`。便携包包含运行环境，不需要安装 Python。
+从 [Releases](https://github.com/thedyingkai/codex-proxy-launcher/releases) 下载 `codex-proxy-launcher-1.0.2-windows-x64.zip`，完整解压后双击 `CodexProxyLauncher.exe`。便携包包含运行环境，不需要安装 Python。
 
 1. 确认已安装 Microsoft Store 版 Codex，以及需要使用的官方浏览器 / Computer Use 插件。
 2. 首次使用先连接自己的代理软件。默认跟随 Windows 系统代理；系统代理关闭时使用保存的地址，初始值为 `http://127.0.0.1:7890`。
@@ -41,7 +41,7 @@ HTTP / mixed 端口可用；当前不支持 SOCKS-only 端口或带用户名密�
 
 - 每次查询 Windows 当前注册的 Codex 安装目录，避免把某次更新的版本目录写死。
 - 给 Electron 设置 `--proxy-server` 和本机地址绕过规则；后台继承 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`WS_PROXY`、`WSS_PROXY` 及 `NODE_USE_ENV_PROXY=1`。
-- 使用独立的 `mcp_servers.node_repl_proxy` 条目，每次启动读取官方 `node_repl` 的当前路径、参数和环境，再加入代理；可选择工具实例时应使用这个代理入口。
+- 自动识别官方工具管理方式：旧版使用独立 `mcp_servers.node_repl_proxy` 条目，读取官方当前路径、参数和环境后加入代理；新版由应用按会话生成工具配置时，使用应用原生入口及主进程代理继承，并移除本启动器已不适用的旧条目。不会重建会话认证或信任设置。
 - 官方浏览器服务路径不存在时，只在已安装的 Browser / Chrome 同版本文件 SHA-256 一致时使用该回退文件。
 - 自动处理 Store 内置插件带有 Windows 加密属性、Local Work 复制文件失败的问题：从当前注册安装目录读取完整官方插件，逐文件校验后生成普通文件副本。每次启动重新检查当前版本及文件内容，更新后自动生成对应副本，不固定版本号，不需要手工改路径。
 - 仅在安装包代码包含内置资源路径配置 `CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH` 时使用该配置；不改写 WindowsApps 或应用源码。此配置是当前应用实现提供的入口，并非公开的稳定 API。
@@ -72,10 +72,10 @@ Codex 用户配置只改动 `node_repl_proxy` 条目；运行 `configure` 时创
 
 - Windows 10 / 11 x64，.NET Framework 4.x；当前实现针对 Microsoft Store 版 Codex 及其官方 `cua_node` 运行时布局。
 - 初始验证环境为 Codex 26.924.6891.0、Node 24.21.0；代码动态发现路径，不将这些版本号作为运行条件。
-- 已通过 22 项本机测试，包括配置保留与回退、更新目录模拟、子进程环境继承、HTTP CONNECT、实际捕获 Node fetch / HTTP 的代理请求，以及更新后插件副本自动切换、损坏副本重建和 Local Work 状态判断。
+- 已通过 24 项本机测试，包括配置保留与回退、更新目录模拟、子进程环境继承、HTTP CONNECT、实际捕获 Node fetch / HTTP 的代理请求、更新后插件副本自动切换、损坏副本重建、Local Work 状态判断及新旧工具管理方式切换。
 - 已验证官方 MCP 初始化和代理传输可达。HTTP 403 / 421 只证明取得 HTTP 响应，不代表登录、API 权限、浏览器控制或 Remote 会话成功。
 - 已实测 Codex 从 26.924.6891.0 更新至 26.930.3930.0 后的路径发现、Edge 页面点击、Computer Use 窗口操作；用户确认手机 / 网页 Remote 连入成功。以上与 dots / Work 的 Local Work 执行器分别验证。
-- 未实测 Windows 冷启动。1.0.1 的 Local Work 修复已验证文件复制和自动更新机制，完整执行器连接还需要重启应用后确认。安装布局或内部接口发生变化时可能需要适配。
+- 2026-10-04 应用重启后，Local Work 第一次启动即连接成功，日志记录 `Local Work executor connected to rendezvous`；执行器进程的一条已建立连接指向本地代理。新版官方工具入口也已实际调用成功。未实测 Windows 冷启动，未代替用户操作 dots 的本机授权界面。安装布局或内部接口发生变化时可能需要适配。
 
 Remote 仍需在 Codex 中启用，电脑保持在线，设备的登录和配对有效。本工具处理代理配置，不改变 Remote 权限。
 
@@ -101,7 +101,7 @@ Remote 仍需在 Codex 中启用，电脑保持在线，设备的登录和配对
 python -X utf8 .\src\test_backend.py
 ```
 
-默认运行独立测试，跳过依赖真实 Codex 的两项检查。在已安装并运行 Codex 的本机，可启用全部 22 项：
+默认运行独立测试，跳过依赖真实 Codex 的两项检查。在已安装并运行 Codex 的本机，可启用全部 24 项：
 
 ```powershell
 $env:CODEX_PROXY_LIVE_TESTS = '1'

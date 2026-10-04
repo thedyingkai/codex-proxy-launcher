@@ -19,6 +19,32 @@ spec.loader.exec_module(b)
 
 
 class LocalWorkTests(unittest.TestCase):
+    def test_per_conversation_tool_config_is_detected_without_version_pin(self):
+        app = Path('C:/Program Files/WindowsApps/OpenAI.Codex_any-version/app/ChatGPT.exe')
+        config = {'mcp_servers':{'cua_repl':{'enabled':False,'command':str(app)}}}
+        with patch.object(b, 'app_entry_contains', return_value=True):
+            self.assertTrue(b.app_manages_tools(config, app))
+            config['mcp_servers']['node_repl'] = {'command':'legacy'}
+            self.assertFalse(b.app_manages_tools(config, app))
+        config['mcp_servers'].pop('node_repl')
+        with patch.object(b, 'app_entry_contains', return_value=False):
+            self.assertFalse(b.app_manages_tools(config, app))
+
+    def test_native_mode_removes_only_this_launchers_alias(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = '[mcp_servers.cua_repl]\nenabled = false\ncommand = "app.exe"\n'
+            (root/'config.toml').write_text(original,encoding='utf-8')
+            with patch.object(b, 'codex_home', return_value=root), patch.object(b, 'STATE', root/'state'), patch.object(b, 'log'):
+                self.assertTrue(b.update_config())
+                self.assertTrue(b.update_config(app_managed=True))
+                self.assertEqual(tomllib.loads((root/'config.toml').read_text()),tomllib.loads(original))
+                self.assertFalse(b.update_config(app_managed=True))
+                other=b.replace_alias(original,{'command':'other.exe','args':['other.py']})
+                (root/'config.toml').write_text(other,encoding='utf-8')
+                self.assertFalse(b.update_config(app_managed=True))
+                self.assertEqual((root/'config.toml').read_text(),other)
+
     def make_app(self, root, version="version-1", supported=True):
         app = root / version / "app/ChatGPT.exe"
         app.parent.mkdir(parents=True)
@@ -246,7 +272,10 @@ class ConfigurationTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("CODEX_PROXY_LIVE_TESTS") == "1", "requires the installed Codex Node runtime")
     def test_installed_node_fetch_and_http_use_env_proxy(self):
-        node = b.official_runtime()[0].parent / "node.exe"
+        # Modern per-conversation tools expose the registered runtime via the app.
+        registered = os.environ.get("CODEX_MCP_NODE_PATH")
+        node = Path(registered) if registered else b.official_runtime()[0].parent / "node.exe"
+        self.assertTrue(node.resolve().is_relative_to((Path(os.environ['LOCALAPPDATA'])/'OpenAI/Codex/runtimes/cua_node').resolve()))
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen(2)
