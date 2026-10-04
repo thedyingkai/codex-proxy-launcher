@@ -390,8 +390,10 @@ def local_work_status(processes, log_root=None):
     result = {"status": "unverified", "message": "未取得当前 Local Work 执行器就绪记录。"}
     for file in sorted(files, key=lambda p: p.stat().st_mtime):
         with file.open("rb") as stream:
-            stream.seek(max(0, file.stat().st_size - 512 * 1024))
-            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+            # Read only executor events, but include the whole active process log:
+            # ordinary chat traffic can push a valid connection past a tail window.
+            lines = [line.decode("utf-8", errors="replace").rstrip()
+                     for line in stream if b"[tpp-local-executor]" in line]
         for line in lines:
             if "[tpp-local-executor]" not in line:
                 continue

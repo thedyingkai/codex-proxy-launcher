@@ -147,6 +147,9 @@ class LocalWorkTests(unittest.TestCase):
             with log.open("a") as f:
                 f.write("2026-10-04T08:02:00.000Z info [tpp-local-executor] Local Work executor connected to rendezvous\n")
             self.assertEqual(b.local_work_status([{"ProcessId":123}], root)["status"], "connected")
+            with log.open("a") as f:
+                f.write("unrelated chat log line\n" * 30000)
+            self.assertEqual(b.local_work_status([{"ProcessId":123}], root)["status"], "connected")
 
 
 class ConfigurationTests(unittest.TestCase):
