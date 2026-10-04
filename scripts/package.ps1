@@ -1,5 +1,5 @@
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version = '1.0.4',
+    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version = '1.0.5',
     [string]$RuntimeArchive = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -29,10 +29,10 @@ if ($actualHash -ne $manifest.sha256) { throw 'Runtime SHA-256 verification fail
 New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packageRoot 'src') -Force | Out-Null
 Expand-Archive -LiteralPath $RuntimeArchive -DestinationPath (Join-Path $packageRoot 'runtime')
-foreach ($name in @('backend.py', 'Launcher.cs', 'NativeProxy.cs', 'build.ps1', 'test_backend.py')) {
+foreach ($name in @('backend.py', 'Launcher.cs', 'NativeProxy.cs', 'cloud_network.py', 'CloudProxy.cs', 'build.ps1', 'test_backend.py')) {
     Copy-Item -LiteralPath (Join-Path $repoRoot "src\$name") -Destination (Join-Path $packageRoot "src\$name")
 }
-foreach ($name in @('CodexProxyLauncher.exe', 'CodexNativeProxy.exe', 'README.md', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md', 'runtime-source.json')) {
+foreach ($name in @('CodexProxyLauncher.exe', 'CodexNativeProxy.exe', 'CodexCloudProxy.exe', 'README.md', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md', 'runtime-source.json')) {
     Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination (Join-Path $packageRoot $name)
 }
 Copy-Item -LiteralPath (Join-Path $repoRoot 'settings.example.json') -Destination (Join-Path $packageRoot 'settings.json')

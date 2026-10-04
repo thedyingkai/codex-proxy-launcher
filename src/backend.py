@@ -36,7 +36,7 @@ POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/Windo
 ALIAS = "node_repl_proxy"
 NO_PROXY = "localhost,127.0.0.1,::1"
 HIDDEN = subprocess.CREATE_NO_WINDOW
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 BUNDLED_RESOURCES_ENV = "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH"
 NATIVE_BRIDGE_ENV = "CODEX_NODE_REPL_PATH"
 NATIVE_BRIDGE = ROOT / "CodexNativeProxy.exe"
@@ -224,7 +224,8 @@ def probe_https(proxy, hostname, timeout=10):
 def network_checks(proxy):
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         return list(pool.map(lambda host: probe_https(proxy, host),
-                             ["chatgpt.com", "api.openai.com", "codex-cloud-environments.chatgpt.com"]))
+                             ["chatgpt.com", "api.openai.com", "codex-cloud-environments.chatgpt.com",
+                              "codex-cloud-backend.chatgpt.com"]))
 
 
 def discover_app(settings):
@@ -461,6 +462,39 @@ def local_work_status(processes, log_root=None):
                 result = {"status": "connecting", "message": "Local Work 执行器已启动，正在等待连接。",
                           "event_time": line[:24]}
     return result
+
+
+def durable_status(processes, log_root=None):
+    root = log_root or Path(os.environ["LOCALAPPDATA"]) / "Codex/Logs"
+    events = []
+    for process in processes:
+        for file in root.glob(f"*/*/*/*-{int(process['ProcessId'])}-t0-*.log"):
+            with file.open("rb") as stream:
+                for raw in stream:
+                    if b"app_server_connection.state_changed" not in raw or b"hostId=durable " not in raw:
+                        continue
+                    line = raw.decode("utf8", "replace")
+                    if line[:19] < process.get("Created", "")[:19]:
+                        continue
+                    match = re.search(r"(?:^| )next=(\w+)(?: |$)", line)
+                    if match:
+                        events.append((line[:24], match[1], "initialized=true" in line))
+    if not events:
+        return {"status": "unverified", "message": "尚未取得当前云端任务 WebSocket 的连接记录。"}
+    when, state, initialized = max(events)
+    connected = state == "connected" and initialized
+    return {"status": "connected" if connected else "failed" if state == "error" else "connecting",
+            "event_time": when,
+            "message": "云端任务 WebSocket 已连接并完成初始化。" if connected
+                       else "云端任务 WebSocket 尚未连通，HTTPS 可达不能替代此项检查。"}
+
+
+def cloud_network_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("launcher_cloud_network", ROOT / "src/cloud_network.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def official_runtime(config=None, home=None):
@@ -807,6 +841,14 @@ def run_action(action):
     proxy, source = choose_proxy(settings)
     progress("使用" + source + "：" + proxy)
     ensure_proxy(settings, proxy, allow_start=action in ("launch", "restart", "configure"))
+    cloud_bridge = {"status": "disabled"}
+    if settings.get("cloud_network_enabled", False):
+        network = cloud_network_module()
+        if action in ("launch", "restart"):
+            progress("正在检查云端网络代理；首次启用虚拟网卡时需要 Windows 管理员确认……")
+            cloud_bridge = network.ensure_running(proxy)
+        else:
+            cloud_bridge = network.running_status(proxy)
     progress("正在检查经代理建立的 HTTPS 连接……")
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         app_future = pool.submit(discover_app, settings)
@@ -817,6 +859,8 @@ def run_action(action):
               "remote_session": "未验证，需要在 Codex 内确认远程设备在线"}
     processes = app_processes()
     report["local_work"] = local_work_status(processes)
+    report["cloud_tasks"] = durable_status(processes)
+    report["cloud_network"] = cloud_bridge
     config = tomllib.loads((codex_home() / "config.toml").read_text(encoding="utf-8-sig"))
     native_tools = app_manages_tools(config, app)
     for item in checks:
@@ -843,13 +887,23 @@ def run_action(action):
             progress("正在验证独立官方工具进程的 MCP 初始化握手……")
             report["mcp"]["handshake"] = check_mcp()
         write_json(LOGS / "latest-diagnostics.json", report)
-        partial = any(not item["reachable"] for item in checks) or report["local_work"]["status"] == "failed"
+        partial = (any(not item["reachable"] for item in checks)
+                   or report["local_work"]["status"] == "failed"
+                   or report["cloud_tasks"]["status"] == "failed"
+                   or settings.get("cloud_network_enabled", False) and cloud_bridge["status"] != "running")
         message = ("部分地址连接失败，请查看日志；官方 MCP 初始化通过。" if partial else "代理连接与官方 MCP 初始化检查通过。")
         if native_tools:
             message = "代理与应用托管工具配置检查已完成。" + report["local_work"]["message"]
         if report["local_work"]["status"] == "failed":
             message = "代理与 MCP 检查已完成；" + report["local_work"]["message"]
-        emit("result", message + "浏览器、Computer Use 和 Remote 的实际会话需在 Codex 中确认。", status="partial" if partial else "checked", report=report)
+        message += report["cloud_tasks"]["message"]
+        emit("result", message + "浏览器和手机 Remote 的实际会话需单独确认。", status="partial" if partial else "checked", report=report)
+        return 0
+    if processes and action == "launch":
+        # Reuse an existing desktop. In particular, do not invoke its executable
+        # as a runtime probe: packaged Electron can treat that as another window.
+        emit("result", "Codex 已在运行，继续使用现有窗口。" + report["cloud_tasks"]["message"],
+             status="already", pid=processes[0]["ProcessId"], report=report)
         return 0
     progress("正在校验当前版本的完整资源，包括插件、浏览器运行环境和 Local Work；更新后首次准备需要一些时间……")
     bundle = prepare_bundled_resources(app)
@@ -913,7 +967,8 @@ def run_action(action):
         if local_work["status"] in ("connected", "failed") or time.monotonic() >= deadline:
             break
         time.sleep(.5)
-    report.update(codex_exe=str(app), bundled_plugins=bundle, local_work=local_work)
+    report.update(codex_exe=str(app), bundled_plugins=bundle, local_work=local_work,
+                  cloud_tasks=durable_status([main]))
     write_json(LOGS / "latest-diagnostics.json", report)
     if local_work["status"] == "failed":
         emit("result", "Codex 已带代理启动；" + local_work["message"], status="partial", pid=main["ProcessId"], report=report)

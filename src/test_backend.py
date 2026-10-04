@@ -18,6 +18,66 @@ b = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(b)
 
 
+class CloudNetworkTests(unittest.TestCase):
+    def make_log(self, root, lines):
+        folder = root / "2026/10/04"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "desktop-123-t0-i1.log").write_text("\n".join(lines), encoding="utf8")
+
+    def test_durable_initialized_not_http_or_ssh_is_readiness(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.make_log(root, [
+                '2026-10-04T12:00:00.000Z info app_server_connection.state_changed hostId=durable initialized=true next=connected ',
+                '2026-10-04T12:01:00.000Z info app_server_connection.state_changed hostId=remote-ssh initialized=false next=error '])
+            self.assertEqual(b.durable_status([{'ProcessId':123}], root)['status'], 'connected')
+            self.make_log(root, [
+                '2026-10-04T12:00:00.000Z info app_server_connection.state_changed hostId=durable initialized=true next=connected ',
+                '2026-10-04T12:01:00.000Z info app_server_connection.state_changed hostId=durable initialized=false next=error '])
+            self.assertEqual(b.durable_status([{'ProcessId':123}], root)['status'], 'failed')
+            self.assertEqual(b.durable_status([{'ProcessId':123, 'Created':'2026-10-04T13:00:00Z'}], root)['status'], 'unverified')
+            self.assertEqual(b.durable_status([{'ProcessId':999}], root)['status'], 'unverified')
+
+    def test_network_status_checks_live_process_family_and_current_proxy(self):
+        cloud = b.cloud_network_module()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root/'status.json').write_text(json.dumps({'status':'running','supervisor_pid':2,'core_pid':3}))
+            (root/'config.json').write_text(json.dumps({'outbounds':[{'tag':'proxy','server':'127.0.0.1','server_port':7890}]}))
+            family = {1:(0,'codexcloudproxy.exe'), 2:(1,'python.exe'), 3:(2,'nekobox_core.exe')}
+            with patch.object(cloud,'STATE',root), patch.object(cloud,'STATUS',root/'status.json'), patch.object(cloud,'process_snapshot',return_value=family):
+                self.assertEqual(cloud.running_status('http://127.0.0.1:7890')['status'],'running')
+                self.assertEqual(cloud.running_status('http://127.0.0.1:8890')['status'],'proxy_changed')
+                family[3]=(9,'nekobox_core.exe')
+                self.assertEqual(cloud.running_status('http://127.0.0.1:7890')['status'],'stale')
+
+    def test_running_network_does_not_elevate_or_spawn_again(self):
+        cloud = b.cloud_network_module()
+        with patch.object(cloud,'running_status',return_value={'status':'running'}), patch.object(cloud.subprocess,'Popen') as spawn:
+            self.assertEqual(cloud.ensure_running('http://127.0.0.1:7890')['status'],'running')
+            spawn.assert_not_called()
+
+    def test_launch_reuses_existing_codex_without_invoking_executable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            (root/'config.toml').write_text('[mcp_servers.node_repl]\ncommand="official.exe"\n')
+            with patch.object(b,'load_settings',return_value={}), patch.object(b,'retire_native_placeholder'), \
+                 patch.object(b,'choose_proxy',return_value=('http://127.0.0.1:7890','fixture')), \
+                 patch.object(b,'ensure_proxy'), patch.object(b,'network_checks',return_value=[{'host':'fixture','reachable':True,'http_status':403}]), \
+                 patch.object(b,'discover_app',return_value=root/'ChatGPT.exe'), \
+                 patch.object(b,'app_processes',return_value=[{'ProcessId':123}]), \
+                 patch.object(b,'local_work_status',return_value={'status':'connected'}), \
+                 patch.object(b,'durable_status',return_value={'status':'connected','message':'connected'}), \
+                 patch.object(b,'codex_home',return_value=root), patch.object(b,'app_manages_tools',return_value=True), \
+                 patch.object(b,'write_json'), patch.object(b,'progress'), patch.object(b,'emit') as emit, \
+                 patch.object(b,'LOGS',root/'logs'), patch.object(b.subprocess,'Popen') as spawn, \
+                 patch.object(b,'prepare_bundled_resources') as prepare:
+                self.assertEqual(b.run_action('launch'),0)
+                spawn.assert_not_called()
+                prepare.assert_not_called()
+                self.assertEqual(emit.call_args.kwargs['status'],'already')
+
+
 class LocalWorkTests(unittest.TestCase):
     def test_per_conversation_tool_config_is_detected_without_version_pin(self):
         app = Path('C:/Program Files/WindowsApps/OpenAI.Codex_any-version/app/ChatGPT.exe')

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.5 — Cloud tasks recovered; prerelease
+
+- Add an opt-in IPv4 TUN companion for cloud WebSockets that ignore application proxy settings. Reuse the user's existing NekoBox 1.6 core and local HTTP proxy; do not alter Codex binaries or install certificates. Windows elevation is required while creating the temporary adapter.
+- Route Codex TCP connections through the proxy and forward other traffic directly. Provide a tray stop action, normal core shutdown, and a supervising Windows job. Public packages keep the option disabled until selected.
+- Reuse an existing Codex process and network companion. Add regression checks against opening a second desktop instance or repeatedly requesting elevation.
+- Report the current desktop's cloud WebSocket initialization separately from HTTPS reachability and Local Work availability.
+- Verify actual recovery without restarting Codex: the durable connection initialized, both previously inaccessible tasks were read, and the user confirmed the tasks opened. Verify graceful shutdown on a separate loopback-only core. Preserve the recovered connection during installation.
+- Run 32 focused tests: 30 passed; two existing opt-in live checks skipped. IPv6, network changes, a full Windows restart, and the next real Codex update remain unverified.
+
 ## 1.0.4 — Edge verified; prerelease
 
 - Preserve the complete installed resources tree, including core and browser executables. A plugins-only resources override caused `node-repl-missing` and Chrome runtime reconciliation errors.

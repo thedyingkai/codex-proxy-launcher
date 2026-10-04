@@ -12,7 +12,7 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Codex Proxy Launcher")]
 [assembly: System.Reflection.AssemblyDescription("Local proxy launcher for Codex; independent community utility")]
-[assembly: System.Reflection.AssemblyVersion("1.0.4.0")]
+[assembly: System.Reflection.AssemblyVersion("1.0.5.0")]
 
 namespace CodexProxyLauncher
 {
@@ -76,7 +76,7 @@ namespace CodexProxyLauncher
             logs = MakeButton("打开日志", 547, 437, 130);
             var restore = new LinkLabel { Text = "撤销工具配置", AutoSize = true, Location = new Point(31, 503),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left, LinkColor = Color.FromArgb(95, 108, 128) };
-            var note = new Label { Text = "本地独立工具  v1.0.4  ·  配置与日志保存在软件目录", AutoSize = true,
+            var note = new Label { Text = "本地独立工具  v1.0.5  ·  配置与日志保存在软件目录", AutoSize = true,
                 Location = new Point(322, 503), ForeColor = Color.FromArgb(120, 130, 145),
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left };
             Controls.AddRange(new Control[] {title, caption, status, progress, details, start, diagnose, settings, logs, restore, note});
@@ -178,7 +178,7 @@ namespace CodexProxyLauncher
     {
         public SettingsForm(string root)
         {
-            Text = "代理设置"; ClientSize = new Size(670, 365); FormBorderStyle = FormBorderStyle.FixedDialog;
+            Text = "代理设置"; ClientSize = new Size(670, 425); FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterParent;
             Font = new Font("Microsoft YaHei UI", 10); BackColor = Color.White;
             var json = new JavaScriptSerializer();
@@ -192,9 +192,11 @@ namespace CodexProxyLauncher
             var browse = new Button { Text = "选择…", Location = new Point(548, 132), Size = new Size(72, 31) };
             var auto = new CheckBox { Text = "代理端口没开启时，自动启动代理软件", Location = new Point(185, 185), Width = 430,
                 Checked = Convert.ToBoolean(data["auto_start_proxy"]) };
-            var note = new Label { Text = "自动模式优先读取系统代理；系统代理关闭时使用保存地址。\n请填写 HTTP / mixed 端口。设置在下次启动时生效。", Location = new Point(26, 232), Size = new Size(616, 53), ForeColor = Color.DimGray };
-            var save = new Button { Text = "保存", DialogResult = DialogResult.None, Location = new Point(510, 307), Size = new Size(110, 36) };
-            Controls.AddRange(new Control[] {mode,url,exe,browse,auto,note,save});
+            var cloud = new CheckBox { Text = "启用云端任务网络代理（NekoBox 1.6 内核）", Location = new Point(185, 222), Width = 440,
+                Checked = data.ContainsKey("cloud_network_enabled") && Convert.ToBoolean(data["cloud_network_enabled"]) };
+            var note = new Label { Text = "云端代理需要管理员确认并创建临时虚拟网卡，接管 IPv4 分流。\nCodex 走现有代理，其他程序直连。可从托盘关闭恢复。\n自动模式跟随系统代理；端口使用 HTTP / mixed。", Location = new Point(26, 275), Size = new Size(616, 70), ForeColor = Color.DimGray };
+            var save = new Button { Text = "保存", DialogResult = DialogResult.None, Location = new Point(510, 367), Size = new Size(110, 36) };
+            Controls.AddRange(new Control[] {mode,url,exe,browse,auto,cloud,note,save});
             string[] titles = { "代理模式", "保存的代理地址", "代理软件程序" };
             for(int i=0;i<3;i++) Controls.Add(new Label {Text=titles[i], Location=new Point(27,31+53*i), AutoSize=true});
             browse.Click += delegate { using (var f = new OpenFileDialog { Filter = "程序 (*.exe)|*.exe" }) if(f.ShowDialog(this)==DialogResult.OK) exe.Text=f.FileName; };
@@ -207,9 +209,14 @@ namespace CodexProxyLauncher
                 data["proxy_url"] = "http://" + u.Authority;
                 data["proxy_app_path"] = exe.Text.Trim();
                 data["auto_start_proxy"] = auto.Checked;
+                data["cloud_network_enabled"] = cloud.Checked;
                 string temp=path+".tmp";
                 File.WriteAllText(temp,json.Serialize(data),new UTF8Encoding(false));
                 File.Replace(temp,path,null);
+                if (!cloud.Checked) {
+                    string cloudState=Path.Combine(root,"state","cloud-network");
+                    if (Directory.Exists(cloudState)) File.WriteAllText(Path.Combine(cloudState,"stop"),"stop");
+                }
                 DialogResult=DialogResult.OK; Close();
             };
         }
