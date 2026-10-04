@@ -5,6 +5,7 @@
 /runtime/
 /dist/
 /CodexProxyLauncher.exe
+/CodexNativeProxy.exe
 /SHA256SUMS.json
 __pycache__/
 *.py[cod]

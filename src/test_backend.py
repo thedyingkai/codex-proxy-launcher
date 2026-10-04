@@ -25,25 +25,45 @@ class LocalWorkTests(unittest.TestCase):
         with patch.object(b, 'app_entry_contains', return_value=True):
             self.assertTrue(b.app_manages_tools(config, app))
             config['mcp_servers']['node_repl'] = {'command':'legacy'}
-            self.assertFalse(b.app_manages_tools(config, app))
+            self.assertTrue(b.app_manages_tools(config, app))
         config['mcp_servers'].pop('node_repl')
         with patch.object(b, 'app_entry_contains', return_value=False):
             self.assertFalse(b.app_manages_tools(config, app))
 
-    def test_native_mode_removes_only_this_launchers_alias(self):
+    def test_native_mode_preserves_dynamic_proxy_connection(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             original = '[mcp_servers.cua_repl]\nenabled = false\ncommand = "app.exe"\n'
             (root/'config.toml').write_text(original,encoding='utf-8')
             with patch.object(b, 'codex_home', return_value=root), patch.object(b, 'STATE', root/'state'), patch.object(b, 'log'):
                 self.assertTrue(b.update_config())
-                self.assertTrue(b.update_config(app_managed=True))
-                self.assertEqual(tomllib.loads((root/'config.toml').read_text()),tomllib.loads(original))
+                self.assertFalse(b.update_config(app_managed=True))
+                current = tomllib.loads((root/'config.toml').read_text())
+                self.assertEqual(current['mcp_servers']['cua_repl'],tomllib.loads(original)['mcp_servers']['cua_repl'])
+                self.assertEqual(current['mcp_servers']['node_repl_proxy'],b.desired_alias(current))
                 self.assertFalse(b.update_config(app_managed=True))
                 other=b.replace_alias(original,{'command':'other.exe','args':['other.py']})
                 (root/'config.toml').write_text(other,encoding='utf-8')
                 self.assertFalse(b.update_config(app_managed=True))
                 self.assertEqual((root/'config.toml').read_text(),other)
+
+    def test_dynamic_proxy_alias_accepts_verified_native_bridge(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            bridge=root/'CodexNativeProxy.exe'
+            bridge.touch()
+            native=root/'node_repl.exe'
+            native.write_bytes(b'official fixture')
+            (root/'native-target.json').write_text(json.dumps({'program':str(native),'sha256':b.file_hash(native)}))
+            managed={'command':str(bridge),'env':{'NODE_REPL_TRUSTED_SERVICES':'unchanged'}}
+            config={'mcp_servers':{'node_repl':managed}}
+            with patch.object(b,'NATIVE_BRIDGE',bridge),patch.object(b,'STATE',root):
+                program,actual=b.official_runtime(config=config)
+                self.assertEqual(program,bridge.resolve())
+                self.assertEqual(actual,managed)
+                native.write_bytes(b'changed')
+                with self.assertRaises(b.LauncherError):
+                    b.official_runtime(config=config)
 
     def make_app(self, root, version="version-1", supported=True):
         app = root / version / "app/ChatGPT.exe"
@@ -55,6 +75,11 @@ class LocalWorkTests(unittest.TestCase):
         (plugin / ".codex-plugin/plugin.json").write_text('{"name":"codex-app-tools"}')
         (plugin / "server.mjs").write_bytes(b"official fixture\x00\xff")
         (plugin / ".mcp.json").write_text('{"mcpServers":{}}')
+        (resources / "codex.exe").write_bytes(b"official-core")
+        native = resources / "cua_node/bin"
+        native.mkdir(parents=True)
+        (native / "node.exe").write_bytes(b"official-node")
+        (native / "node_repl.exe").write_bytes(b"official-node-repl")
         script = b.BUNDLED_RESOURCES_ENV.encode() if supported else b"no override in this app"
         header = json.dumps({"files":{".vite":{"files":{"build":{"files":{
             "main-test.js":{"offset":"0","size":len(script)}}}}}}}).encode()
@@ -74,6 +99,43 @@ class LocalWorkTests(unittest.TestCase):
             self.assertEqual(b.tree_hashes(Path(first["resources_path"])/"plugins"), original)
             self.assertEqual(b.tree_hashes(b.bundled_plugin_source(app)), original)
             self.assertFalse(any(b.encrypted_file(p) for p in b.regular_tree_files(Path(first["resources_path"])/"plugins")))
+            # Regression: a plugins-only root silently removes browser/core runtime discovery.
+            self.assertEqual(b.tree_hashes(Path(first["resources_path"])), b.tree_hashes(app.parent/"resources"))
+            self.assertTrue((Path(first["resources_path"])/"cua_node/bin/node_repl.exe").is_file())
+            self.assertTrue((Path(first["resources_path"])/"codex.exe").is_file())
+
+    def test_runtime_changes_invalidate_cache_even_when_plugins_are_identical(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            app = self.make_app(root)
+            with patch.object(b, "STATE", root/"state"), patch.object(b, "encrypted_file", return_value=True), patch.object(b, "log"):
+                old = b.prepare_bundled_resources(app)
+                (app.parent/"resources/cua_node/bin/node_repl.exe").write_bytes(b"updated-official-runtime")
+                new = b.prepare_bundled_resources(app)
+            self.assertNotEqual(old["resources_path"], new["resources_path"])
+            self.assertEqual((Path(new["resources_path"])/"cua_node/bin/node_repl.exe").read_bytes(), b"updated-official-runtime")
+
+    def test_native_bridge_preserves_official_environment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            app = self.make_app(root)
+            bridge = root/"bridge.exe"
+            bridge.touch()
+            with patch.object(b, "STATE", root/"state"), patch.object(b, "NATIVE_BRIDGE", bridge):
+                self.assertEqual(b.prepare_native_bridge(app, {}), str(bridge))
+                original = {"NODE_REPL_TRUSTED_SERVICES":"exact-official-value", "SKY_CUA_SERVICE_NATIVE_PIPE_PATH":"official-pipe"}
+                with patch.dict(os.environ, original), patch.object(b, "load_settings", return_value={}), patch.object(b, "choose_proxy", return_value=("http://127.0.0.1:7890", "fixture")), patch.object(b, "port_open", return_value=True), patch.object(b.subprocess, "Popen") as start:
+                    start.return_value.wait.return_value = 0
+                    self.assertEqual(b.run_native_mcp(), 0)
+                    actual = start.call_args.kwargs["env"]
+                    for key, value in original.items():
+                        self.assertEqual(actual[key], value)
+                    self.assertEqual(actual["HTTPS_PROXY"], "http://127.0.0.1:7890")
+                    self.assertEqual(start.call_args.args[0], [str(app.parent/"resources/cua_node/bin/node_repl.exe")])
+                (app.parent/"resources/cua_node/bin/node_repl.exe").write_bytes(b"changed")
+                with patch.object(b.subprocess, "Popen") as start:
+                    self.assertEqual(b.run_native_mcp(), 1)
+                    start.assert_not_called()
 
     def test_app_update_automatically_selects_new_plugin_copy(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -132,6 +194,26 @@ class LocalWorkTests(unittest.TestCase):
                 b.write_json(state/"last-launch.json", saved)
                 self.assertEqual(b.prior_launch_matches([process], saved["proxy"], "new-copy"), 123)
                 self.assertIsNone(b.prior_launch_matches([process], saved["proxy"], "updated-copy"))
+                self.assertIsNone(b.prior_launch_matches([process], saved["proxy"], "new-copy", "bridge.exe"))
+                saved['native_bridge'] = 'bridge.exe'
+                b.write_json(state/"last-launch.json", saved)
+                self.assertEqual(b.prior_launch_matches([process], saved["proxy"], "new-copy", "bridge.exe"), 123)
+
+    def test_withdrawn_placeholder_is_removed_without_removing_real_server(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = '[model] # unrelated setting\nname = "unchanged"\n'
+            withdrawn = {'command':str(b.PYTHON),'args':['-I','-X','utf8',str(b.SCRIPT),'native-placeholder']}
+            path=root/'config.toml'
+            path.write_text(b.replace_alias(original,withdrawn,'node_repl'),encoding='utf8')
+            with patch.object(b,'STATE',root/'state'),patch.object(b,'codex_home',return_value=root):
+                self.assertTrue(b.retire_native_placeholder())
+                self.assertEqual(tomllib.loads(path.read_text(encoding='utf8')),tomllib.loads(original))
+                self.assertTrue((root/'state/native-guardian.stop').exists())
+                real=b.replace_alias(original,{'command':'official-node_repl.exe','env':{'official':'preserved'}},'node_repl')
+                path.write_text(real,encoding='utf8')
+                self.assertFalse(b.retire_native_placeholder())
+                self.assertEqual(path.read_text(encoding='utf8'),real)
 
     def test_diagnostics_distinguish_active_executor_from_old_logs(self):
         with tempfile.TemporaryDirectory() as folder:

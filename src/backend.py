@@ -36,8 +36,10 @@ POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/Windo
 ALIAS = "node_repl_proxy"
 NO_PROXY = "localhost,127.0.0.1,::1"
 HIDDEN = subprocess.CREATE_NO_WINDOW
-VERSION = "1.0.2"
+VERSION = "1.0.4"
 BUNDLED_RESOURCES_ENV = "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH"
+NATIVE_BRIDGE_ENV = "CODEX_NODE_REPL_PATH"
+NATIVE_BRIDGE = ROOT / "CodexNativeProxy.exe"
 
 
 class LauncherError(Exception):
@@ -311,23 +313,42 @@ def supports_bundle_override(resources):
 
 
 def app_manages_tools(config, app):
-    """New desktop builds generate trusted MCP configuration per conversation."""
-    servers = config.get("mcp_servers", {})
-    if isinstance(servers.get("node_repl"), dict):
-        return False
-    disabled = servers.get("cua_repl", {})
-    if disabled.get("enabled") is not False:
-        return False
-    if not re.search(r"(?i)[\\/]WindowsApps[\\/]OpenAI\.Codex_[^\\/]+[\\/]app[\\/](ChatGPT|Codex)\.exe$",
-                     str(disabled.get("command", ""))):
-        return False
+    """Require the installed desktop's native executable override contract."""
     return app_entry_contains(app.parent / "resources",
-                              ["getExpectedThreadConfig", "getTrustedServiceEnv", "mcp_servers.node_repl"])
+                              [NATIVE_BRIDGE_ENV, "CODEX_BROWSER_USE_NODE_PATH", "mcp_servers.node_repl"])
 
 
 def tree_hashes(root):
-    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+    return {p.relative_to(root).as_posix(): file_hash(p)
             for p in regular_tree_files(root)}
+
+
+def file_hash(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def copy_verified_file(source, target, expected):
+    """Stream bytes so EFS metadata is not propagated; publish only verified data."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".launcher-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as out, source.open("rb") as inp:
+            while chunk := inp.read(4 * 1024 * 1024):
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        if file_hash(temporary) != expected:
+            raise LauncherError("复制期间 Codex 资源发生变化，请等待更新完成后重试。")
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def resource_hashes(root):
+    # The launcher inventory lives beside, not inside, the resource contents.
+    return tree_hashes(root)
 
 
 def prepare_bundled_resources(app):
@@ -336,12 +357,13 @@ def prepare_bundled_resources(app):
     Never decrypt or change the Store installation. Never patch plugin contents.
     A cache is reused only after comparing every file with this installed version.
     """
-    source = bundled_plugin_source(app)
-    if source is None:
+    plugins = bundled_plugin_source(app)
+    if plugins is None:
         return {"status": "not_applicable", "resources_path": None}
-    source_files = regular_tree_files(source)
-    if not any(encrypted_file(p) for p in source_files):
+    if not any(encrypted_file(p) for p in regular_tree_files(plugins)):
         return {"status": "native", "resources_path": None}
+    source = app.parent / "resources"
+    source_files = regular_tree_files(source)
     if not supports_bundle_override(app.parent / "resources"):
         raise LauncherError("检测到加密的内置插件，但当前应用未提供已验证的资源路径设置；请查看 Local Work 兼容性日志。")
     expected = tree_hashes(source)
@@ -351,33 +373,62 @@ def prepare_bundled_resources(app):
         raise LauncherError("启动器插件副本目录不能是链接。")
     # Include the source inventory, so updates never reuse a prior version's files.
     identity = hashlib.sha256((str(app) + json.dumps(expected, sort_keys=True)).encode()).hexdigest()[:16]
-    key = "resources-" + identity
+    key = "complete-resources-" + identity
     for candidate in sorted(cache_parent.glob(key + "*")):
         try:
             if candidate.is_symlink() or candidate.is_junction():
                 continue
-            if (candidate / "manifest.json").is_file() and tree_hashes(candidate / "plugins") == expected:
-                return {"status": "verified", "resources_path": str(candidate), "files": len(expected)}
+            if (candidate / "manifest.json").is_file() and resource_hashes(candidate / "resources") == expected:
+                return {"status": "verified", "resources_path": str(candidate / "resources"), "files": len(expected)}
         except (OSError, LauncherError):
             continue
     staging = Path(tempfile.mkdtemp(prefix="building-", dir=cache_parent))
     for src in source_files:
         relative = src.relative_to(source)
-        data = src.read_bytes()
-        if hashlib.sha256(data).hexdigest() != expected[relative.as_posix()]:
-            raise LauncherError("复制期间 Codex 插件发生变化，请等待应用更新完成后重试。")
-        # Writing contents preserves normal inherited ACLs and does not copy EFS.
-        atomic_write(staging / "plugins" / relative, data)
-    if tree_hashes(staging / "plugins") != expected:
-        raise LauncherError("插件副本校验失败，未使用该副本启动应用。")
+        copy_verified_file(src, staging / "resources" / relative, expected[relative.as_posix()])
+    if resource_hashes(staging / "resources") != expected:
+        raise LauncherError("完整资源副本校验失败，未使用该副本启动应用。")
     write_json(staging / "manifest.json", {"app": str(app), "source": str(source),
                "created": stamp(), "sha256": expected})
     destination = cache_parent / key
     if destination.exists():
         destination = cache_parent / (key + "-" + staging.name.removeprefix("building-"))
     staging.rename(destination)
-    log("Verified official plugin copy: " + str(destination) + "; files=" + str(len(expected)))
-    return {"status": "prepared", "resources_path": str(destination), "files": len(expected)}
+    log("Verified complete official resources: " + str(destination) + "; files=" + str(len(expected)))
+    return {"status": "prepared", "resources_path": str(destination / "resources"), "files": len(expected)}
+
+
+def prepare_native_bridge(app, bundle):
+    resources = Path(bundle.get("resources_path") or app.parent / "resources")
+    official = resources / "cua_node/bin/node_repl.exe"
+    installed = app.parent / "resources/cua_node/bin/node_repl.exe"
+    if not NATIVE_BRIDGE.is_file() or not official.is_file() or not installed.is_file():
+        raise LauncherError("官方浏览器运行文件或代理入口不完整，未启动 Codex。")
+    digest = file_hash(installed)
+    if file_hash(official) != digest:
+        raise LauncherError("浏览器运行文件与当前安装版本不一致，未启动 Codex。")
+    write_json(STATE / "native-target.json", {"program": str(official), "sha256": digest,
+                                            "installed_app": str(app), "created": stamp()})
+    return str(NATIVE_BRIDGE)
+
+
+def run_native_mcp():
+    """Forward the desktop-generated environment intact and add only proxy values."""
+    try:
+        target = json.loads((STATE / "native-target.json").read_text(encoding="utf-8"))
+        program = Path(target["program"])
+        if program.name.lower() != "node_repl.exe" or file_hash(program) != target["sha256"]:
+            raise LauncherError("官方浏览器运行文件校验失败，请重新运行代理启动器。")
+        proxy, _ = choose_proxy(load_settings())
+        if not port_open(proxy):
+            raise LauncherError("代理端口未开启；浏览器工具没有改用直连。")
+        # No trusted-service, identity, sandbox, or permission fields are rewritten.
+        child = subprocess.Popen([str(program)], env=proxy_env(proxy), stdin=sys.stdin,
+                                 stdout=sys.stdout, stderr=sys.stderr, creationflags=HIDDEN)
+        return child.wait()
+    except Exception as error:
+        print("Codex Proxy Launcher: " + str(error), file=sys.stderr, flush=True)
+        return 1
 
 
 def local_work_status(processes, log_root=None):
@@ -419,6 +470,15 @@ def official_runtime(config=None, home=None):
     if not isinstance(managed, dict):
         raise LauncherError("Codex 尚未生成官方 node_repl 配置。请在 Codex 中启用浏览器或 Computer Use 插件后重试。")
     p = Path(managed.get("command", "")).resolve()
+    # The desktop may already use this launcher's stable native entry point.
+    # Keep the independent proxy connection dynamic by reading the managed
+    # environment on every start, as in the previously working Edge repair.
+    if p == NATIVE_BRIDGE.resolve() and p.is_file():
+        target = json.loads((STATE / "native-target.json").read_text(encoding="utf-8"))
+        official = Path(target["program"])
+        if official.name.lower() != "node_repl.exe" or file_hash(official) != target["sha256"]:
+            raise LauncherError("官方浏览器运行文件校验失败，请重新运行代理启动器。")
+        return p, copy.deepcopy(managed)
     runtime_root = Path(os.environ["LOCALAPPDATA"]) / "OpenAI/Codex/runtimes/cua_node"
     roots = [runtime_root.resolve()]
     # Older portable releases used a resources/cua_node directory. Only the
@@ -513,12 +573,13 @@ def table_path(header):
         return None
 
 
-def replace_alias(text, alias):
+def replace_alias(text, alias, server_name=None):
     """Edit complete table spans, preserving all unrelated TOML byte text.
 
     Prefix parsing prevents a header-looking line inside a multiline string or
     array from being misidentified as a table. Parse/semantic checks fail closed.
     """
+    server_name = server_name or ALIAS
     original = tomllib.loads(text)
     headers = []
     for m in re.finditer(r"(?m)^[ \t]*\[.*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|$)", text):
@@ -532,22 +593,22 @@ def replace_alias(text, alias):
         headers.append((m.start(), path))
     targets = []
     for i, (start, path) in enumerate(headers):
-        if path[:2] == ("mcp_servers", ALIAS):
+        if path[:2] == ("mcp_servers", server_name):
             targets.append((start, headers[i+1][0] if i+1 < len(headers) else len(text)))
-    current = original.get("mcp_servers", {}).get(ALIAS)
+    current = original.get("mcp_servers", {}).get(server_name)
     if current is not None and not targets:
         raise LauncherError("MCP 配置使用了内联表或不支持的表结构，无法安全替换。原文件保持不变。")
     updated = text
     for start, end in reversed(targets):
         updated = updated[:start] + updated[end:]
     if alias is not None:
-        block = "[mcp_servers." + ALIAS + "]\n"
+        block = "[mcp_servers." + server_name + "]\n"
         block += "\n".join(json.dumps(k) + " = " + toml_value(v) for k, v in alias.items()) + "\n"
         updated = updated.rstrip() + "\n\n" + block
     expected = copy.deepcopy(original)
-    expected.setdefault("mcp_servers", {}).pop(ALIAS, None)
+    expected.setdefault("mcp_servers", {}).pop(server_name, None)
     if alias is not None:
-        expected["mcp_servers"][ALIAS] = alias
+        expected["mcp_servers"][server_name] = alias
     actual = tomllib.loads(updated)
     # An otherwise empty table is harmless, but no other semantic change is allowed.
     if expected.get("mcp_servers") == {}:
@@ -581,7 +642,7 @@ def update_config(restore=False, app_managed=False):
         text = original.decode("utf-8-sig")
         config = tomllib.loads(text)
         old = config.get("mcp_servers", {}).get(ALIAS)
-        if app_managed and old and (old.get("command") != str(PYTHON) or str(SCRIPT) not in old.get("args", [])):
+        if app_managed and old and not owned_alias(old):
             return False  # Never remove another installation's or user's entry.
         if not owned_alias(old):
             raise LauncherError("同名 node_repl_proxy 已被其他工具占用，未覆盖。请检查 config.toml。")
@@ -592,8 +653,6 @@ def update_config(restore=False, app_managed=False):
             if prior["config_path"] != str(config_path):
                 raise LauncherError("回退文件对应另一份 Codex 配置，未覆盖当前文件。")
             alias = prior["previous_alias"]
-        elif app_managed:
-            alias = None
         else:
             alias = desired_alias(config)
         if old == alias:
@@ -702,13 +761,14 @@ def close_app(processes):
     raise LauncherError("Codex 尚未正常退出，可能有保存提示。请处理提示或手动退出后重试；没有强制结束进程。")
 
 
-def prior_launch_matches(processes, proxy, bundled_resources=None):
+def prior_launch_matches(processes, proxy, bundled_resources=None, native_bridge=None):
     p = STATE / "last-launch.json"
     if not p.exists():
         return None
     saved = json.loads(p.read_text(encoding="utf-8"))
     if (saved.get("proxy") != proxy or not saved.get("launcher_version")
-            or saved.get("bundled_plugins_resources") != bundled_resources):
+            or saved.get("bundled_plugins_resources") != bundled_resources
+            or (native_bridge is not None and saved.get("native_bridge") != native_bridge)):
         return None
     for process in processes:
         if (process["ProcessId"] == saved.get("pid") and process["Created"] == saved.get("created")
@@ -718,8 +778,28 @@ def prior_launch_matches(processes, proxy, bundled_resources=None):
     return None
 
 
+def retire_native_placeholder():
+    """Remove only the exact withdrawn 1.0.3 placeholder from this installation."""
+    atomic_write(STATE / "native-guardian.stop", b"stop\n")
+    path = codex_home() / "config.toml"
+    original = path.read_bytes()
+    cfg = tomllib.loads(original.decode("utf-8-sig"))
+    server = cfg.get("mcp_servers", {}).get("node_repl", {})
+    if server.get("command") != str(PYTHON) or server.get("args") != ["-I", "-X", "utf8", str(SCRIPT), "native-placeholder"]:
+        return False
+    backup = STATE / "backups" / ("withdrawn-placeholder-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".toml")
+    atomic_write(backup, original)
+    updated = replace_alias(original.decode("utf-8-sig"), None, "node_repl")
+    if path.read_bytes() != original:
+        raise LauncherError("Codex 正在刷新配置，请等待后重试。")
+    atomic_write(path, updated.encode("utf-8-sig" if original.startswith(b"\xef\xbb\xbf") else "utf-8"))
+    return True
+
+
 def run_action(action):
     settings = load_settings()
+    if action != "diagnose":
+        retire_native_placeholder()
     if action == "restore":
         changed = update_config(restore=True)
         emit("result", "已恢复启动器安装前的工具配置；其他 Codex 设置保持当前值。" if changed else "工具配置无需恢复。", status="restored")
@@ -744,7 +824,7 @@ def run_action(action):
                                 if item["reachable"] else "：连接失败，" + item.get("error", "")))
     try:
         if native_tools:
-            report["mcp"] = {"mode": "app-managed", "meaning": "官方工具配置由应用按会话生成，继承主程序代理；不重建其信任或认证设置。"}
+            report["mcp"] = {"mode": "app-managed", "meaning": "官方工具配置由应用生成；独立启动入口为工具进程补充代理。实际浏览器会话尚未验证。"}
         else:
             _, _, _, info = mcp_configuration(settings)
             report["mcp"] = {"mode": "legacy-wrapper", "configuration": info}
@@ -771,12 +851,13 @@ def run_action(action):
             message = "代理与 MCP 检查已完成；" + report["local_work"]["message"]
         emit("result", message + "浏览器、Computer Use 和 Remote 的实际会话需在 Codex 中确认。", status="partial" if partial else "checked", report=report)
         return 0
-    progress("正在自动检查当前安装版本的内置插件，并校验 Local Work 所需文件……")
+    progress("正在校验当前版本的完整资源，包括插件、浏览器运行环境和 Local Work；更新后首次准备需要一些时间……")
     bundle = prepare_bundled_resources(app)
     report["bundled_plugins"] = bundle
     write_json(LOGS / "latest-diagnostics.json", report)
     if bundle["resources_path"]:
-        progress("内置插件副本已校验。以后更新时会自动重新识别并准备，无需手动修改版本或路径。")
+        progress("完整官方资源副本已校验，更新后会自动重新准备。")
+    bridge = prepare_native_bridge(app, bundle) if native_tools else None
     progress("正在检查工具代理配置；配置变化前会自动备份……")
     changed = update_config(app_managed=native_tools)
     if action == "configure":
@@ -784,7 +865,7 @@ def run_action(action):
         emit("result", "已保存代理工具配置并创建桌面“Codex 代理启动”快捷方式。当前 Codex 会话没有重启。", status="configured", shortcut=shortcut, changed=changed)
         return 0
     if processes:
-        matched = prior_launch_matches(processes, proxy, bundle["resources_path"])
+        matched = prior_launch_matches(processes, proxy, bundle["resources_path"], bridge)
         if matched and action != "restart":
             emit("result", "Codex 已通过本启动器运行，代理配置相同。", status="already", pid=matched)
             return 0
@@ -795,14 +876,18 @@ def run_action(action):
         close_app(processes)
         app = discover_app(settings)  # Closing can complete an application update.
         bundle = prepare_bundled_resources(app)
+        native_tools = app_manages_tools(config, app)
+        bridge = prepare_native_bridge(app, bundle) if native_tools else None
     progress("正在通过代理启动当前安装的 Codex……")
     env = proxy_env(proxy)
     # Never retain a previous version's resource override from the parent shell.
     for key in list(env):
-        if key.upper() == BUNDLED_RESOURCES_ENV:
+        if key.upper() in (BUNDLED_RESOURCES_ENV, NATIVE_BRIDGE_ENV):
             del env[key]
     if bundle["resources_path"]:
         env[BUNDLED_RESOURCES_ENV] = bundle["resources_path"]
+    if bridge:
+        env[NATIVE_BRIDGE_ENV] = bridge
     args = [str(app), "--proxy-server=" + proxy,
             "--proxy-bypass-list=localhost;127.0.0.1;[::1]"]
     child = subprocess.Popen(args, cwd=ROOT, env=env, close_fds=True)
@@ -820,7 +905,7 @@ def run_action(action):
     main = next((p for p in candidates if p["ProcessId"] == child.pid), candidates[0])
     write_json(STATE / "last-launch.json", {"time": stamp(), "pid": main["ProcessId"],
               "created": main["Created"], "exe": main["ExecutablePath"], "proxy": proxy,
-              "launcher_version": VERSION, "bundled_plugins_resources": bundle["resources_path"]})
+              "launcher_version": VERSION, "bundled_plugins_resources": bundle["resources_path"], "native_bridge": bridge})
     progress("Codex 已启动，正在读取本次 Local Work 执行器的连接状态……")
     deadline = time.monotonic() + 12
     while True:
@@ -840,8 +925,10 @@ def run_action(action):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["launch", "restart", "configure", "diagnose", "restore", "mcp", "mcp-config"])
+    parser.add_argument("action", choices=["launch", "restart", "configure", "diagnose", "restore", "mcp", "mcp-config", "native-mcp"])
     args = parser.parse_args()
+    if args.action == "native-mcp":
+        return run_native_mcp()
     if args.action == "mcp":
         return run_mcp()
     if args.action == "mcp-config":
