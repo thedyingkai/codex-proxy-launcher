@@ -1,0 +1,184 @@
+"""Regression tests run only against isolated files and local test servers."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import tomllib
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location("backend", Path(__file__).with_name("backend.py"))
+b = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(b)
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_proxy_validation_and_credentials_rejected(self):
+        self.assertEqual(b.validate_proxy("http://[::1]:7890/"), "http://[::1]:7890")
+        for value in ["socks5://127.0.0.1:7890", "http://user:password@localhost:7890", "http://localhost:0",
+                      "http://localhost:7890/path", "http://localhost:7890?x=1", "http://localhost:99999",
+                      "http://localhost", "http://localhost:7890\n"]:
+            with self.subTest(value=value), self.assertRaises(b.LauncherError):
+                b.validate_proxy(value)
+
+    def test_auto_proxy_follows_port_change(self):
+        settings = {"proxy_mode": "auto", "proxy_url": "http://127.0.0.1:7890"}
+        self.assertEqual(b.choose_proxy(settings, "http://127.0.0.1:8899")[0], "http://127.0.0.1:8899")
+        self.assertEqual(b.choose_proxy(settings, "")[0], settings["proxy_url"])
+        settings["proxy_mode"] = "manual"
+        self.assertEqual(b.choose_proxy(settings, "http://127.0.0.1:8899")[0], settings["proxy_url"])
+
+    def test_child_env_drops_stale_lowercase_and_wildcard_bypass(self):
+        old = {"HTTP_PROXY": "old", "https_proxy": "old", "all_proxy": "old", "no_proxy": "*", "KEEP": "unchanged"}
+        env = b.proxy_env("http://127.0.0.1:7890", old)
+        self.assertNotIn("https_proxy", env)
+        self.assertEqual(env["NO_PROXY"], "localhost,127.0.0.1,::1")
+        self.assertEqual(env["NODE_USE_ENV_PROXY"], "1")
+        self.assertEqual(env["KEEP"], "unchanged")
+        self.assertEqual(old["no_proxy"], "*")
+
+    def test_toml_preserves_unrelated_tables_and_multiline_text(self):
+        src = '''model = "same"\nnotes = """hello\n[mcp_servers.node_repl_proxy]\nnot a table\n"""\n[mcp_servers.node_repl]\ncommand = 'C:\\official\\node_repl.exe'\n[mcp_servers."node_repl_proxy"]\ncommand = "old"\n[mcp_servers.node_repl_proxy.env]\nOLD = "value"\n[mcp_servers.node_repl_proxy_other]\ncommand = "must remain"\n[desktop]\nkeepRemoteControlAwakeWhilePluggedIn = true\n'''
+        alias = {"command": "new", "args": ["你好", 'a"b'], "env_vars": [{"name": "X", "source": "local"}]}
+        result = b.replace_alias(src, alias)
+        parsed = tomllib.loads(result)
+        self.assertEqual(parsed["notes"], tomllib.loads(src)["notes"])
+        self.assertEqual(parsed["mcp_servers"]["node_repl_proxy"], alias)
+        self.assertEqual(parsed["mcp_servers"]["node_repl_proxy_other"]["command"], "must remain")
+        self.assertTrue(parsed["desktop"]["keepRemoteControlAwakeWhilePluggedIn"])
+
+    def test_inline_toml_fails_without_silent_rewrite(self):
+        with self.assertRaises(b.LauncherError):
+            b.replace_alias('mcp_servers = { node_repl_proxy = { command = "old" } }\n', {"command": "new"})
+
+    def test_atomic_config_is_idempotent_and_rollback_keeps_later_edits(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            before = 'model = "original"\n[mcp_servers.node_repl]\ncommand = "official"\nenv_vars = ["CURRENT"]\n'
+            (root / "config.toml").write_text(before, encoding="utf8")
+            with patch.object(b, "codex_home", return_value=root), patch.object(b, "STATE", root/"state"), patch.object(b, "log"):
+                self.assertTrue(b.update_config())
+                once = (root/"config.toml").read_bytes()
+                self.assertFalse(b.update_config())
+                self.assertEqual((root/"config.toml").read_bytes(), once)
+                text = once.decode().replace('model = "original"', 'model = "later-user-edit"')
+                (root/"config.toml").write_bytes(text.encode("utf8"))
+                self.assertTrue(b.update_config(restore=True))
+                result = tomllib.loads((root/"config.toml").read_text())
+                self.assertEqual(result["model"], "later-user-edit")
+                self.assertNotIn(b.ALIAS, result["mcp_servers"])
+                self.assertFalse(b.update_config(restore=True))
+
+    def test_browser_fallback_selects_newest_equal_official_pair(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for version, equal in [("26.9.9", True), ("26.10.2", True), ("26.11.0", False)]:
+                for plugin in ["browser", "chrome"]:
+                    file = root/"plugins/cache/openai-bundled"/plugin/version/"scripts/browser-service.mjs"
+                    file.parent.mkdir(parents=True)
+                    file.write_bytes(b"same" if equal or plugin == "browser" else b"different")
+            env = {"NODE_REPL_TRUSTED_SERVICES": json.dumps({"browser": str(root/"missing.mjs"), "sky":"@oai/sky/service"})}
+            path = b.browser_fallback(env, root)
+            self.assertIn("26.10.2", path)
+            self.assertEqual(json.loads(env["NODE_REPL_TRUSTED_SERVICES"])["sky"], "@oai/sky/service")
+
+    def test_browser_missing_pair_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            env = {"NODE_REPL_TRUSTED_SERVICES": json.dumps({"browser": str(root/"missing")})}
+            with self.assertRaises(b.LauncherError):
+                b.browser_fallback(env, root)
+
+    @unittest.skipUnless(os.environ.get("CODEX_PROXY_LIVE_TESTS") == "1", "requires an installed, running Codex desktop")
+    def test_powershell_process_detection_observes_actual_desktop(self):
+        results = b.app_processes()
+        self.assertTrue(isinstance(results, list))
+        # This test machine is running Codex. No process is terminated.
+        self.assertTrue(any("OpenAI.Codex_" in p["ExecutablePath"] for p in results))
+
+    def test_app_update_is_discovered_without_saved_version_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for version in ["OpenAI.Codex_1", "OpenAI.Codex_2"]:
+                app = root/version/"app/ChatGPT.exe"
+                app.parent.mkdir(parents=True)
+                app.touch()
+                with patch.object(b, "run_ps", return_value=json.dumps([str(app.parent.parent)])):
+                    self.assertEqual(b.discover_app({}), app)
+
+    def test_actual_child_receives_proxy_settings(self):
+        env = b.proxy_env("http://127.0.0.1:7890")
+        result = subprocess.run([sys.executable, "-I", "-c",
+            "import os,json; print(json.dumps({k:os.environ[k] for k in ['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','NODE_USE_ENV_PROXY']}))"],
+            capture_output=True, text=True, env=env, creationflags=b.HIDDEN, timeout=5, check=True)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["HTTPS_PROXY"], "http://127.0.0.1:7890")
+        self.assertEqual(data["NODE_USE_ENV_PROXY"], "1")
+
+    def test_proxy_probe_uses_connect_and_does_not_fall_back(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1",0))
+        listener.listen(1)
+        seen = []
+        def serve():
+            connection, _ = listener.accept()
+            with connection:
+                seen.append(connection.recv(4096))
+                connection.sendall(b"HTTP/1.1 502 Intentional-test-failure\r\nContent-Length: 0\r\n\r\n")
+            listener.close()
+        thread = threading.Thread(target=serve)
+        thread.start()
+        result = b.probe_https("http://127.0.0.1:"+str(listener.getsockname()[1]), "destination.invalid", timeout=2)
+        thread.join(timeout=3)
+        self.assertFalse(result["reachable"])
+        self.assertIn(b"CONNECT destination.invalid:443", seen[0])
+
+    @unittest.skipUnless(os.environ.get("CODEX_PROXY_LIVE_TESTS") == "1", "requires the installed Codex Node runtime")
+    def test_installed_node_fetch_and_http_use_env_proxy(self):
+        node = b.official_runtime()[0].parent / "node.exe"
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        listener.settimeout(6)
+        address = "http://127.0.0.1:" + str(listener.getsockname()[1])
+        seen = []
+        def serve():
+            try:
+                for _ in range(2):
+                    connection, _ = listener.accept()
+                    with connection:
+                        seen.append(connection.recv(4096))
+                        connection.sendall(b"HTTP/1.1 502 Intentional-test-failure\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                listener.close()
+        thread = threading.Thread(target=serve)
+        thread.start()
+        script = "try { await fetch('https://destination.invalid', {signal: AbortSignal.timeout(4000)}); } catch {} "
+        script += "await new Promise(r=>{ const q=require('node:http').get('http://destination.invalid/test',x=>{x.resume();r()}); q.on('error',r); q.setTimeout(4000,()=>{q.destroy();r()}) });"
+        result = subprocess.run([str(node), "-e", "(async()=>{" + script + "})()"],
+                                env=b.proxy_env(address), capture_output=True,
+                                creationflags=b.HIDDEN, timeout=10)
+        thread.join(timeout=7)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertTrue(any(b"CONNECT destination.invalid:443" in x for x in seen))
+        self.assertTrue(any(b"GET http://destination.invalid/test" in x for x in seen))
+
+    def test_configuration_does_not_change_official_security_fields(self):
+        fixture = {"mcp_servers": {"node_repl": {"env_vars": ["AUTH_FROM_HOST"], "env": {"NODE_REPL_TRUSTED_SERVICES":"original"}}},
+                   "approval_policy":"on-request", "sandbox_mode":"workspace-write"}
+        snapshot = json.loads(json.dumps(fixture))
+        alias = b.desired_alias(fixture)
+        self.assertEqual(fixture, snapshot)
+        self.assertIn("AUTH_FROM_HOST", alias["env_vars"])
+        self.assertNotIn("env", alias)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

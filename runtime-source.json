@@ -1,0 +1,6 @@
+{
+  "url": "https://www.python.org/ftp/python/3.14.6/python-3.14.6-embed-amd64.zip",
+  "sha256": "df901e84a896ff1ee720ad03377e0c8d8c2244fda79808aeeaff6316df1cb75c",
+  "bytes": 12570832,
+  "license": "runtime/LICENSE.txt"
+}

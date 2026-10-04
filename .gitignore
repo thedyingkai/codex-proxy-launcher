@@ -1,0 +1,15 @@
+# Per-machine data and credentials must never enter the repository.
+/settings.json
+/state/
+/logs/
+/runtime/
+/dist/
+/CodexProxyLauncher.exe
+/SHA256SUMS.json
+__pycache__/
+*.py[cod]
+*.log
+*.zip
+*.bak
+*.tmp
+/.build-cache/

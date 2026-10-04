@@ -1,0 +1,666 @@
+"""Codex Proxy Launcher. Standard library only; never modifies vendor binaries.
+
+GUI actions emit JSON lines. `mcp` exclusively forwards the official MCP stdio.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import copy
+import ctypes
+import datetime as dt
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from urllib.parse import urlsplit
+import winreg
+
+ROOT = Path(__file__).resolve().parent.parent
+SETTINGS = ROOT / "settings.json"
+STATE = ROOT / "state"
+LOGS = ROOT / "logs"
+PYTHON = ROOT / "runtime" / "python.exe"
+SCRIPT = ROOT / "src" / "backend.py"
+POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+ALIAS = "node_repl_proxy"
+NO_PROXY = "localhost,127.0.0.1,::1"
+HIDDEN = subprocess.CREATE_NO_WINDOW
+VERSION = "1.0.0"
+
+
+class LauncherError(Exception):
+    pass
+
+
+def stamp():
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def atomic_write(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".launcher-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def write_json(path, value):
+    atomic_write(path, (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def emit(kind, message, **extra):
+    print(json.dumps({"type": kind, "message": message, **extra}, ensure_ascii=False), flush=True)
+
+
+def log(message):
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with (LOGS / (dt.date.today().isoformat() + ".log")).open("a", encoding="utf-8") as f:
+        f.write(stamp() + " " + message + "\n")
+
+
+def progress(message):
+    emit("status", message)
+    log(message)
+
+
+def load_settings():
+    data = json.loads(SETTINGS.read_text(encoding="utf-8-sig"))
+    if data.get("schema_version") != 1:
+        raise LauncherError("设置文件版本不受支持。请保留日志并检查 settings.json。")
+    return data
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).resolve()
+
+
+def run_ps(code, extra_env=None, timeout=25):
+    # No user-controlled values are inserted into PowerShell source.
+    env = os.environ.copy()
+    env.update(extra_env or {})
+    import base64
+    prefix = "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+    p = subprocess.run([str(POWERSHELL), "-NoLogo", "-NoProfile", "-NonInteractive",
+                        "-EncodedCommand", base64.b64encode((prefix + code).encode("utf-16le")).decode()],
+                       capture_output=True, encoding="utf-8", errors="replace", env=env,
+                       creationflags=HIDDEN, timeout=timeout)
+    if p.returncode:
+        raise LauncherError("Windows 查询未完成：" + p.stderr.strip()[:600])
+    return p.stdout.strip()
+
+
+def system_proxy():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+            enabled = winreg.QueryValueEx(key, "ProxyEnable")[0]
+            value = winreg.QueryValueEx(key, "ProxyServer")[0]
+    except (FileNotFoundError, OSError):
+        return None
+    if not enabled or not value:
+        return None
+    if "=" in value:
+        pairs = dict(x.strip().split("=", 1) for x in value.split(";") if "=" in x)
+        value = pairs.get("https") or pairs.get("http")
+    if not value:
+        return None
+    return value if "://" in value else "http://" + value
+
+
+def validate_proxy(value):
+    if not isinstance(value, str) or any(c in value for c in "\r\n\t "):
+        raise LauncherError("代理地址不能包含空白；示例：http://127.0.0.1:7890")
+    try:
+        u = urlsplit(value)
+        if (u.scheme != "http" or not u.hostname or u.username is not None or u.password is not None
+                or u.path not in ("", "/") or u.query or u.fragment or not u.port):
+            raise ValueError()
+        if not 1 <= u.port <= 65535:
+            raise ValueError()
+    except ValueError:
+        raise LauncherError("请填写无账号密码的 HTTP / mixed 代理地址，如 http://127.0.0.1:7890。")
+    host = "[" + u.hostname + "]" if ":" in u.hostname else u.hostname
+    return "http://" + host + ":" + str(u.port)
+
+
+def choose_proxy(settings, detected=None):
+    mode = settings.get("proxy_mode", "auto")
+    if mode not in ("auto", "manual"):
+        raise LauncherError("代理模式必须为 auto 或 manual。")
+    if mode == "auto":
+        detected = system_proxy() if detected is None else detected
+        if detected:
+            return validate_proxy(detected), "Windows 当前系统代理"
+    return validate_proxy(settings.get("proxy_url", "")), "已保存的代理地址"
+
+
+def proxy_env(proxy, base=None):
+    env = dict(os.environ if base is None else base)
+    names = {"http_proxy", "https_proxy", "all_proxy", "ws_proxy", "wss_proxy", "no_proxy", "node_use_env_proxy"}
+    for key in list(env):
+        if key.lower() in names:
+            del env[key]
+    env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, ALL_PROXY=proxy, WS_PROXY=proxy, WSS_PROXY=proxy,
+               NO_PROXY=NO_PROXY, NODE_USE_ENV_PROXY="1")
+    return env
+
+
+def port_open(proxy, timeout=1):
+    u = urlsplit(proxy)
+    try:
+        with socket.create_connection((u.hostname, u.port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_proxy(settings, proxy, allow_start):
+    if port_open(proxy):
+        return
+    app = settings.get("proxy_app_path", "")
+    if allow_start and settings.get("auto_start_proxy", False) and app:
+        path = Path(app).resolve()
+        if not path.is_file() or path.suffix.lower() != ".exe":
+            raise LauncherError("代理软件路径不存在，请在“代理设置”中重新选择。")
+        existing = run_ps("@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $env:CP_PROXY_APP }).Count",
+                          {"CP_PROXY_APP": str(path)})
+        if existing.strip() == "0":
+            progress("正在启动代理软件，等待本地代理端口就绪……")
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup.wShowWindow = 0
+            subprocess.Popen([str(path)], cwd=path.parent, creationflags=HIDDEN,
+                             startupinfo=startup, close_fds=True)
+        else:
+            progress("代理软件已运行，正在等待代理端口……")
+        deadline = time.monotonic() + min(max(int(settings.get("proxy_wait_seconds", 25)), 1), 50)
+        while time.monotonic() < deadline:
+            if port_open(proxy, .6):
+                return
+            time.sleep(.4)
+    raise LauncherError("代理端口未开启。请确认代理软件已连接，或在“代理设置”中改成当前 HTTP / mixed 端口。")
+
+
+def probe_https(proxy, hostname, timeout=10):
+    """Explicit HTTP CONNECT then verified TLS. There is no direct fallback."""
+    u = urlsplit(proxy)
+    connection = http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout,
+                                             context=ssl.create_default_context())
+    connection.set_tunnel(hostname, 443)
+    started = time.monotonic()
+    try:
+        connection.request("HEAD", "/", headers={"User-Agent": "CodexProxyLauncher/" + VERSION})
+        response = connection.getresponse()
+        return {"host": hostname, "reachable": True, "http_status": response.status,
+                "seconds": round(time.monotonic() - started, 2),
+                "meaning": "TLS 与 HTTP 可达；未验证登录或 Remote 会话"}
+    except Exception as error:
+        return {"host": hostname, "reachable": False, "error": str(error)[:240],
+                "seconds": round(time.monotonic() - started, 2)}
+    finally:
+        connection.close()
+
+
+def network_checks(proxy):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        return list(pool.map(lambda host: probe_https(proxy, host),
+                             ["chatgpt.com", "api.openai.com", "codex-cloud-environments.chatgpt.com"]))
+
+
+def discover_app(settings):
+    override = settings.get("codex_exe", "")
+    if override:
+        p = Path(override).resolve()
+        if not p.is_file() or p.name.lower() not in ("chatgpt.exe", "codex.exe"):
+            raise LauncherError("设置中的 Codex 桌面程序路径无效。")
+        return p
+    raw = run_ps("@((Get-AppxPackage -Name 'OpenAI.Codex' | Sort-Object Version -Descending) | Select-Object -ExpandProperty InstallLocation) | ConvertTo-Json -Compress")
+    locations = json.loads(raw) if raw else []
+    if isinstance(locations, str):
+        locations = [locations]
+    for location in locations:
+        for name in ("ChatGPT.exe", "Codex.exe"):
+            p = Path(location) / "app" / name
+            if p.is_file():
+                return p
+    raise LauncherError("没有找到当前用户安装的 Codex 桌面应用。请安装后重试，或设置 codex_exe。")
+
+
+def app_processes():
+    raw = run_ps("@(Get-CimInstance Win32_Process -Filter \"Name = 'ChatGPT.exe' OR Name = 'Codex.exe'\" | Where-Object { $_.ExecutablePath -match '\\\\WindowsApps\\\\OpenAI\\.Codex_[^\\\\]+\\\\app\\\\' -and $_.CommandLine -notmatch '--type=' } | Select-Object ProcessId,ExecutablePath,CommandLine,@{n='Created';e={$_.CreationDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Compress")
+    parsed = json.loads(raw) if raw else []
+    return [parsed] if isinstance(parsed, dict) else parsed
+
+
+def official_runtime(config=None, home=None):
+    home = home or codex_home()
+    config = config or tomllib.loads((home / "config.toml").read_text(encoding="utf-8-sig"))
+    managed = config.get("mcp_servers", {}).get("node_repl")
+    if not isinstance(managed, dict):
+        raise LauncherError("Codex 尚未生成官方 node_repl 配置。请在 Codex 中启用浏览器或 Computer Use 插件后重试。")
+    p = Path(managed.get("command", "")).resolve()
+    runtime_root = Path(os.environ["LOCALAPPDATA"]) / "OpenAI/Codex/runtimes/cua_node"
+    roots = [runtime_root.resolve()]
+    # Older portable releases used a resources/cua_node directory. Only the
+    # currently managed installed executable is accepted, never a downloaded helper.
+    if p.name.lower() != "node_repl.exe" or not p.is_relative_to(roots[0]):
+        raise LauncherError("官方 Node REPL 的安装结构已变化；为避免选择错误程序，请检查日志中的兼容性说明。")
+    if not p.is_file():
+        raise LauncherError("Codex 更新后的工具路径尚未刷新。先打开 Codex 等待更新完成，再运行本启动器。")
+    return p, copy.deepcopy(managed)
+
+
+def version_key(name):
+    try:
+        return tuple(int(x) for x in name.split("."))
+    except ValueError:
+        return (-1,)
+
+
+def browser_fallback(env, home):
+    if "NODE_REPL_TRUSTED_SERVICES" not in env:
+        return None
+    services = json.loads(env["NODE_REPL_TRUSTED_SERVICES"])
+    configured = services.get("browser")
+    if not configured or Path(configured).is_file():
+        return configured
+    cache = home / "plugins/cache/openai-bundled"
+    browser_root = cache / "browser"
+    if not browser_root.is_dir():
+        raise LauncherError("官方浏览器插件文件尚未安装完整，请在 Codex 中完成插件更新。")
+    for folder in sorted(browser_root.iterdir(), key=lambda p: version_key(p.name), reverse=True):
+        if version_key(folder.name) == (-1,):
+            continue
+        browser = folder / "scripts/browser-service.mjs"
+        chrome = cache / "chrome" / folder.name / "scripts/browser-service.mjs"
+        if browser.is_file() and chrome.is_file():
+            if hashlib.sha256(browser.read_bytes()).digest() == hashlib.sha256(chrome.read_bytes()).digest():
+                services["browser"] = browser.as_posix()
+                env["NODE_REPL_TRUSTED_SERVICES"] = json.dumps(services, ensure_ascii=False)
+                return str(browser)
+    raise LauncherError("找不到可验证的官方浏览器服务。请完成 Browser / Chrome 插件更新；没有修改插件代码。")
+
+
+def mcp_configuration(settings=None, home=None):
+    settings = settings or load_settings()
+    home = home or codex_home()
+    program, managed = official_runtime(home=home)
+    env = os.environ.copy()
+    env.update({k: str(v) for k, v in managed.get("env", {}).items()})
+    proxy, source = choose_proxy(settings)
+    env = proxy_env(proxy, env)
+    browser = browser_fallback(env, home)
+    return program, managed.get("args", []), env, {"official_program": str(program),
+        "browser_service": browser, "proxy": proxy, "proxy_source": source}
+
+
+def managed_env_vars(config):
+    values = copy.deepcopy(config.get("mcp_servers", {}).get("node_repl", {}).get("env_vars", []))
+    for name in ("CODEX_HOME", "CODEX_WINDOWS_REGISTERED_CORE"):
+        if not any(x == name or isinstance(x, dict) and x.get("name") == name for x in values):
+            values.append(name)
+    return values
+
+
+def toml_value(value):
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(x) for x in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(json.dumps(k) + " = " + toml_value(v) for k, v in value.items()) + " }"
+    raise LauncherError("不支持的 MCP 配置类型；原配置未改变。")
+
+
+def table_path(header):
+    marker = "__codex_proxy_launcher_marker__"
+    try:
+        obj = tomllib.loads(header + "\n" + marker + " = 1\n")
+        result = []
+        while marker not in obj:
+            if len(obj) != 1:
+                return None
+            key, obj = next(iter(obj.items()))
+            result.append(key)
+            if isinstance(obj, list):
+                obj = obj[-1]
+        return tuple(result)
+    except Exception:
+        return None
+
+
+def replace_alias(text, alias):
+    """Edit complete table spans, preserving all unrelated TOML byte text.
+
+    Prefix parsing prevents a header-looking line inside a multiline string or
+    array from being misidentified as a table. Parse/semantic checks fail closed.
+    """
+    original = tomllib.loads(text)
+    headers = []
+    for m in re.finditer(r"(?m)^[ \t]*\[.*\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|$)", text):
+        path = table_path(m.group().strip())
+        if path is None:
+            continue
+        try:
+            tomllib.loads(text[:m.start()])
+        except tomllib.TOMLDecodeError:
+            continue
+        headers.append((m.start(), path))
+    targets = []
+    for i, (start, path) in enumerate(headers):
+        if path[:2] == ("mcp_servers", ALIAS):
+            targets.append((start, headers[i+1][0] if i+1 < len(headers) else len(text)))
+    current = original.get("mcp_servers", {}).get(ALIAS)
+    if current is not None and not targets:
+        raise LauncherError("MCP 配置使用了内联表或不支持的表结构，无法安全替换。原文件保持不变。")
+    updated = text
+    for start, end in reversed(targets):
+        updated = updated[:start] + updated[end:]
+    if alias is not None:
+        block = "[mcp_servers." + ALIAS + "]\n"
+        block += "\n".join(json.dumps(k) + " = " + toml_value(v) for k, v in alias.items()) + "\n"
+        updated = updated.rstrip() + "\n\n" + block
+    expected = copy.deepcopy(original)
+    expected.setdefault("mcp_servers", {}).pop(ALIAS, None)
+    if alias is not None:
+        expected["mcp_servers"][ALIAS] = alias
+    actual = tomllib.loads(updated)
+    # An otherwise empty table is harmless, but no other semantic change is allowed.
+    if expected.get("mcp_servers") == {}:
+        expected.pop("mcp_servers", None)
+    if actual.get("mcp_servers") == {}:
+        actual.pop("mcp_servers", None)
+    if actual != expected:
+        raise LauncherError("配置完整性检查未通过；没有写入任何修改。")
+    return updated
+
+
+def desired_alias(config):
+    return {"command": str(PYTHON), "args": ["-I", "-X", "utf8", str(SCRIPT), "mcp"],
+            "startup_timeout_sec": 120, "env_vars": managed_env_vars(config)}
+
+
+def owned_alias(alias):
+    if not alias:
+        return True
+    args = [str(x).lower().replace("/", "\\") for x in alias.get("args", [])]
+    return (any(x.endswith("\\node_repl_proxy_launcher.py") for x in args)
+            or any(x.endswith("\\src\\backend.py") for x in args) and "mcp" in args)
+
+
+def update_config(restore=False):
+    config_path = codex_home() / "config.toml"
+    STATE.mkdir(parents=True, exist_ok=True)
+    rollback = STATE / "mcp-before.json"
+    for attempt in range(4):
+        original = config_path.read_bytes()
+        text = original.decode("utf-8-sig")
+        config = tomllib.loads(text)
+        old = config.get("mcp_servers", {}).get(ALIAS)
+        if not owned_alias(old):
+            raise LauncherError("同名 node_repl_proxy 已被其他工具占用，未覆盖。请检查 config.toml。")
+        if restore:
+            if not rollback.exists():
+                return False
+            prior = json.loads(rollback.read_text(encoding="utf-8"))
+            if prior["config_path"] != str(config_path):
+                raise LauncherError("回退文件对应另一份 Codex 配置，未覆盖当前文件。")
+            alias = prior["previous_alias"]
+        else:
+            alias = desired_alias(config)
+        if old == alias:
+            return False
+        updated = replace_alias(text, alias)
+        encoded = updated.encode("utf-8-sig" if original.startswith(b"\xef\xbb\xbf") else "utf-8")
+        if config_path.read_bytes() != original:
+            time.sleep(.15)
+            continue
+        if not restore and not rollback.exists():
+            write_json(rollback, {"config_path": str(config_path), "previous_alias": old, "created": stamp()})
+        backup_dir = STATE / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        backup = backup_dir / ("config-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".toml")
+        backup.write_bytes(original)
+        # Last comparison protects against ordinary app regeneration while editing.
+        if config_path.read_bytes() != original:
+            continue
+        atomic_write(config_path, encoded)
+        after = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
+        if after.get("mcp_servers", {}).get(ALIAS) != alias:
+            raise LauncherError("Codex 同时刷新了配置，请再点一次“配置并启动”。")
+        log("MCP alias " + ("restored" if restore else "configured") + "; backup=" + str(backup))
+        return True
+    raise LauncherError("Codex 正在连续更新配置，请等待更新结束后重试。")
+
+
+def install_shortcut():
+    exe = ROOT / "CodexProxyLauncher.exe"
+    result = run_ps("$d=[Environment]::GetFolderPath('Desktop'); $p=Join-Path $d 'Codex 代理启动.lnk'; $w=New-Object -ComObject WScript.Shell; if(Test-Path -LiteralPath $p) { $o=$w.CreateShortcut($p); if($o.TargetPath -ne $env:CP_TARGET) { throw 'A shortcut with this name already exists.' } }; $s=$w.CreateShortcut($p); $s.TargetPath=$env:CP_TARGET; $s.WorkingDirectory=$env:CP_ROOT; $s.Description='检查代理并启动当前版本 Codex'; $s.IconLocation=$env:CP_TARGET+',0'; $s.Save(); $p",
+                    {"CP_TARGET": str(exe), "CP_ROOT": str(ROOT)})
+    return result
+
+
+def run_mcp():
+    try:
+        program, args, env, info = mcp_configuration()
+        if not port_open(info["proxy"]):
+            raise LauncherError("代理端口未开启，请通过 Codex 代理启动器启动。")
+        log("MCP official runtime=" + str(program) + "; browser=" + str(info["browser_service"]))
+        child = subprocess.Popen([str(program), *args], env=env,
+                                 stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+                                 creationflags=HIDDEN)
+        return child.wait()
+    except Exception as error:
+        print("Codex Proxy Launcher: " + str(error), file=sys.stderr, flush=True)
+        return 1
+
+
+def check_mcp():
+    request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "codex-proxy-launcher-check", "version": VERSION}}}
+    p = subprocess.Popen([str(PYTHON), "-I", "-X", "utf8", str(SCRIPT), "mcp"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         creationflags=HIDDEN)
+    import queue
+    import threading
+    replies = queue.Queue()
+    def read():
+        for line in p.stdout:
+            try:
+                x = json.loads(line)
+                if x.get("id") == 1:
+                    replies.put(x)
+                    return
+            except ValueError:
+                pass
+        replies.put(None)
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        p.stdin.write((json.dumps(request) + "\n").encode())
+        p.stdin.flush()
+        result = replies.get(timeout=20)
+        if not result or "result" not in result:
+            raise LauncherError("官方 MCP 初始化握手未完成。")
+        return {"initialized": True, "server": result["result"].get("serverInfo"),
+                "meaning": "仅验证官方工具启动和协议握手，未执行浏览器或电脑操作"}
+    finally:
+        p.stdin.close()
+        try:
+            p.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            # This is our isolated diagnostic wrapper, never the desktop's process.
+            p.terminate()
+
+
+def close_app(processes):
+    targets = {int(p["ProcessId"]) for p in processes}
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    user.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    user.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    @callback_type
+    def visitor(hwnd, unused):
+        pid = ctypes.c_ulong()
+        user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in targets and user.IsWindowVisible(ctypes.c_void_p(hwnd)):
+            user.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE, permits app save/cancel.
+        return True
+    user.EnumWindows(visitor, 0)
+    for _ in range(10):
+        time.sleep(1)
+        if not targets.intersection(int(p["ProcessId"]) for p in app_processes()):
+            return
+    raise LauncherError("Codex 尚未正常退出，可能有保存提示。请处理提示或手动退出后重试；没有强制结束进程。")
+
+
+def prior_launch_matches(processes, proxy):
+    p = STATE / "last-launch.json"
+    if not p.exists():
+        return None
+    saved = json.loads(p.read_text(encoding="utf-8"))
+    if saved.get("proxy") != proxy:
+        return None
+    for process in processes:
+        if (process["ProcessId"] == saved.get("pid") and process["Created"] == saved.get("created")
+                and process["ExecutablePath"] == saved.get("exe")
+                and ("--proxy-server=" + proxy) in process.get("CommandLine", "")):
+            return process["ProcessId"]
+    return None
+
+
+def run_action(action):
+    settings = load_settings()
+    if action == "restore":
+        changed = update_config(restore=True)
+        emit("result", "已恢复启动器安装前的工具配置；其他 Codex 设置保持当前值。" if changed else "工具配置无需恢复。", status="restored")
+        return 0
+    proxy, source = choose_proxy(settings)
+    progress("使用" + source + "：" + proxy)
+    ensure_proxy(settings, proxy, allow_start=action in ("launch", "restart", "configure"))
+    progress("正在检查经代理建立的 HTTPS 连接……")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        app_future = pool.submit(discover_app, settings)
+        checks = network_checks(proxy)
+        app = app_future.result()
+    report = {"time": stamp(), "launcher_version": VERSION, "proxy": proxy, "proxy_source": source,
+              "codex_exe": str(app), "network": checks, "mcp": None,
+              "remote_session": "未验证，需要在 Codex 内确认远程设备在线"}
+    for item in checks:
+        progress(item["host"] + ("：代理 TLS/HTTP 可达（HTTP " + str(item["http_status"]) + "，不代表已登录）"
+                                if item["reachable"] else "：连接失败，" + item.get("error", "")))
+    try:
+        _, _, _, info = mcp_configuration(settings)
+        report["mcp"] = {"configuration": info}
+    except Exception as error:
+        report["mcp"] = {"error": str(error)}
+    LOGS.mkdir(parents=True, exist_ok=True)
+    write_json(LOGS / "latest-diagnostics.json", report)
+    if not any(x["reachable"] for x in checks):
+        raise LauncherError("代理端口可用，但 OpenAI 地址的 TLS/HTTP 检查都失败。请先切换可用代理节点，再重试。")
+    if action == "diagnose":
+        if report["mcp"].get("error"):
+            raise LauncherError(report["mcp"]["error"])
+        progress("正在验证独立官方工具进程的 MCP 初始化握手……")
+        report["mcp"]["handshake"] = check_mcp()
+        write_json(LOGS / "latest-diagnostics.json", report)
+        partial = any(not item["reachable"] for item in checks)
+        message = ("部分地址连接失败，请查看日志；官方 MCP 初始化通过。" if partial else "代理连接与官方 MCP 初始化检查通过。")
+        emit("result", message + "浏览器、Computer Use 和 Remote 的实际会话需在 Codex 中确认。", status="partial" if partial else "checked", report=report)
+        return 0
+    progress("正在检查工具代理配置；配置变化前会自动备份……")
+    changed = update_config()
+    if action == "configure":
+        shortcut = install_shortcut()
+        emit("result", "已保存代理工具配置并创建桌面“Codex 代理启动”快捷方式。当前 Codex 会话没有重启。", status="configured", shortcut=shortcut, changed=changed)
+        return 0
+    processes = app_processes()
+    if processes:
+        matched = prior_launch_matches(processes, proxy)
+        if matched and action != "restart":
+            emit("result", "Codex 已通过本启动器运行，代理配置相同。", status="already", pid=matched)
+            return 0
+        if action != "restart":
+            emit("result", "Codex 当前已在运行，已有进程无法继承新代理。请先结束正在执行的任务，再点击“正常关闭并重启”，或手动退出 Codex 后重试。", status="running")
+            return 0
+        progress("正在请求 Codex 正常退出……")
+        close_app(processes)
+        app = discover_app(settings)  # Closing can complete an application update.
+    progress("正在通过代理启动当前安装的 Codex……")
+    env = proxy_env(proxy)
+    args = [str(app), "--proxy-server=" + proxy,
+            "--proxy-bypass-list=localhost;127.0.0.1;[::1]"]
+    child = subprocess.Popen(args, cwd=ROOT, env=env, close_fds=True)
+    observed = []
+    for _ in range(8):
+        time.sleep(1)
+        observed = app_processes()
+        if observed:
+            break
+        if child.poll() not in (None, 0):
+            break
+    candidates = [p for p in observed if ("--proxy-server=" + proxy) in p.get("CommandLine", "")]
+    if not candidates:
+        raise LauncherError("未观察到带代理参数的 Codex 主进程。应用可能正在更新；请等更新结束后重试。")
+    main = next((p for p in candidates if p["ProcessId"] == child.pid), candidates[0])
+    write_json(STATE / "last-launch.json", {"time": stamp(), "pid": main["ProcessId"],
+              "created": main["Created"], "exe": main["ExecutablePath"], "proxy": proxy})
+    emit("result", "Codex 已带代理启动。新建工具连接会使用已保存的官方代理启动配置。", status="launched", pid=main["ProcessId"])
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["launch", "restart", "configure", "diagnose", "restore", "mcp", "mcp-config"])
+    args = parser.parse_args()
+    if args.action == "mcp":
+        return run_mcp()
+    if args.action == "mcp-config":
+        print(json.dumps(mcp_configuration()[3], ensure_ascii=False))
+        return 0
+    # Cross-process lock for GUI and CLI. The MCP wrapper is deliberately separate.
+    import msvcrt
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / "action.lock").open("a+b") as lock:
+        lock.seek(0)
+        lock.write(b"0")
+        lock.flush()
+        lock.seek(0)
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            emit("error", "另一个启动器正在操作，请稍等。")
+            return 1
+        try:
+            return run_action(args.action)
+        except Exception as error:
+            log(type(error).__name__ + ": " + str(error))
+            emit("error", str(error))
+            return 1
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
