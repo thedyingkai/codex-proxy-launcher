@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,8 @@ POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/Windo
 ALIAS = "node_repl_proxy"
 NO_PROXY = "localhost,127.0.0.1,::1"
 HIDDEN = subprocess.CREATE_NO_WINDOW
-VERSION = "1.0.0"
+VERSION = "1.0.1"
+BUNDLED_RESOURCES_ENV = "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH"
 
 
 class LauncherError(Exception):
@@ -246,6 +248,146 @@ def app_processes():
     raw = run_ps("@(Get-CimInstance Win32_Process -Filter \"Name = 'ChatGPT.exe' OR Name = 'Codex.exe'\" | Where-Object { $_.ExecutablePath -match '\\\\WindowsApps\\\\OpenAI\\.Codex_[^\\\\]+\\\\app\\\\' -and $_.CommandLine -notmatch '--type=' } | Select-Object ProcessId,ExecutablePath,CommandLine,@{n='Created';e={$_.CreationDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Compress")
     parsed = json.loads(raw) if raw else []
     return [parsed] if isinstance(parsed, dict) else parsed
+
+
+def regular_tree_files(root):
+    """Reject junctions/symlinks before reading or copying a plugin tree."""
+    root = Path(root)
+    files = []
+    if root.is_symlink() or root.is_junction():
+        raise LauncherError("插件目录包含链接，未复制或修改该目录。")
+    for directory, dirs, names in os.walk(root, followlinks=False):
+        for name in dirs + names:
+            path = Path(directory) / name
+            if path.lstat().st_file_attributes & 0x400:
+                raise LauncherError("插件目录包含重解析点，未复制或修改该目录。")
+            if name in names:
+                if not path.is_file():
+                    raise LauncherError("插件目录包含非常规文件。")
+                files.append(path)
+    return sorted(files)
+
+
+def encrypted_file(path):
+    return bool(path.stat().st_file_attributes & 0x4000)
+
+
+def bundled_plugin_source(app):
+    resources = app.parent / "resources"
+    for base in (resources, resources / "app.asar.unpacked"):
+        plugins = base / "plugins"
+        marker = plugins / "openai-bundled/plugins/codex-app-tools/.codex-plugin/plugin.json"
+        if marker.is_file():
+            return plugins
+    return None
+
+
+def supports_bundle_override(resources):
+    """Inspect the installed app's own entry scripts, without altering them."""
+    try:
+        with (resources / "app.asar").open("rb") as stream:
+            header = struct.unpack("<4I", stream.read(16))
+            if not 0 < header[3] <= 16 * 1024 * 1024 or header[1] < header[3] + 4:
+                return False
+            archive = json.loads(stream.read(header[3]))
+            entries = archive["files"][".vite"]["files"]["build"]["files"]
+            for name, entry in entries.items():
+                if not name.endswith(".js") or "offset" not in entry:
+                    continue
+                size = int(entry["size"])
+                if not 0 < size <= 16 * 1024 * 1024:
+                    continue
+                stream.seek(8 + header[1] + int(entry["offset"]))
+                if BUNDLED_RESOURCES_ENV.encode() in stream.read(size):
+                    return True
+    except (OSError, ValueError, KeyError, struct.error):
+        pass
+    return False
+
+
+def tree_hashes(root):
+    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in regular_tree_files(root)}
+
+
+def prepare_bundled_resources(app):
+    """Materialize identical official files, avoiding CopyFile's EFS propagation.
+
+    Never decrypt or change the Store installation. Never patch plugin contents.
+    A cache is reused only after comparing every file with this installed version.
+    """
+    source = bundled_plugin_source(app)
+    if source is None:
+        return {"status": "not_applicable", "resources_path": None}
+    source_files = regular_tree_files(source)
+    if not any(encrypted_file(p) for p in source_files):
+        return {"status": "native", "resources_path": None}
+    if not supports_bundle_override(app.parent / "resources"):
+        raise LauncherError("检测到加密的内置插件，但当前应用未提供已验证的资源路径设置；请查看 Local Work 兼容性日志。")
+    expected = tree_hashes(source)
+    cache_parent = STATE / "bundled-resources"
+    cache_parent.mkdir(parents=True, exist_ok=True)
+    if cache_parent.is_symlink() or cache_parent.is_junction():
+        raise LauncherError("启动器插件副本目录不能是链接。")
+    # Include the source inventory, so updates never reuse a prior version's files.
+    identity = hashlib.sha256((str(app) + json.dumps(expected, sort_keys=True)).encode()).hexdigest()[:16]
+    key = "resources-" + identity
+    for candidate in sorted(cache_parent.glob(key + "*")):
+        try:
+            if candidate.is_symlink() or candidate.is_junction():
+                continue
+            if (candidate / "manifest.json").is_file() and tree_hashes(candidate / "plugins") == expected:
+                return {"status": "verified", "resources_path": str(candidate), "files": len(expected)}
+        except (OSError, LauncherError):
+            continue
+    staging = Path(tempfile.mkdtemp(prefix="building-", dir=cache_parent))
+    for src in source_files:
+        relative = src.relative_to(source)
+        data = src.read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected[relative.as_posix()]:
+            raise LauncherError("复制期间 Codex 插件发生变化，请等待应用更新完成后重试。")
+        # Writing contents preserves normal inherited ACLs and does not copy EFS.
+        atomic_write(staging / "plugins" / relative, data)
+    if tree_hashes(staging / "plugins") != expected:
+        raise LauncherError("插件副本校验失败，未使用该副本启动应用。")
+    write_json(staging / "manifest.json", {"app": str(app), "source": str(source),
+               "created": stamp(), "sha256": expected})
+    destination = cache_parent / key
+    if destination.exists():
+        destination = cache_parent / (key + "-" + staging.name.removeprefix("building-"))
+    staging.rename(destination)
+    log("Verified official plugin copy: " + str(destination) + "; files=" + str(len(expected)))
+    return {"status": "prepared", "resources_path": str(destination), "files": len(expected)}
+
+
+def local_work_status(processes, log_root=None):
+    """Only the active desktop process's events count as readiness evidence."""
+    root = log_root or Path(os.environ["LOCALAPPDATA"]) / "Codex/Logs"
+    files = []
+    for process in processes:
+        pid = int(process["ProcessId"])
+        files.extend(root.glob(f"*/*/*/*-{pid}-t0-*.log"))
+    result = {"status": "unverified", "message": "未取得当前 Local Work 执行器就绪记录。"}
+    for file in sorted(files, key=lambda p: p.stat().st_mtime):
+        with file.open("rb") as stream:
+            stream.seek(max(0, file.stat().st_size - 512 * 1024))
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+        for line in lines:
+            if "[tpp-local-executor]" not in line:
+                continue
+            if "Local Work executor connected to rendezvous" in line:
+                result = {"status": "connected", "message": "Local Work 执行器已连接。", "event_time": line[:24]}
+            elif any(x in line for x in ("executor startup failed", "executor process failed",
+                                        "executor exited", "executor rendezvous unavailable")):
+                copying = "copyfile" in line and "codex-app-tools" in line
+                result = {"status": "failed", "reason": "plugin_copy" if copying else "executor_error",
+                          "message": "Local Work 执行器复制内置插件失败，需要应用修复后重启。" if copying
+                                     else "Local Work 执行器尚未就绪，请查看应用连接日志。",
+                          "event_time": line[:24]}
+            elif "Local Work executor spawned; awaiting rendezvous" in line:
+                result = {"status": "connecting", "message": "Local Work 执行器已启动，正在等待连接。",
+                          "event_time": line[:24]}
+    return result
 
 
 def official_runtime(config=None, home=None):
@@ -534,12 +676,13 @@ def close_app(processes):
     raise LauncherError("Codex 尚未正常退出，可能有保存提示。请处理提示或手动退出后重试；没有强制结束进程。")
 
 
-def prior_launch_matches(processes, proxy):
+def prior_launch_matches(processes, proxy, bundled_resources=None):
     p = STATE / "last-launch.json"
     if not p.exists():
         return None
     saved = json.loads(p.read_text(encoding="utf-8"))
-    if saved.get("proxy") != proxy:
+    if (saved.get("proxy") != proxy or saved.get("launcher_version") != VERSION
+            or saved.get("bundled_plugins_resources") != bundled_resources):
         return None
     for process in processes:
         if (process["ProcessId"] == saved.get("pid") and process["Created"] == saved.get("created")
@@ -566,6 +709,8 @@ def run_action(action):
     report = {"time": stamp(), "launcher_version": VERSION, "proxy": proxy, "proxy_source": source,
               "codex_exe": str(app), "network": checks, "mcp": None,
               "remote_session": "未验证，需要在 Codex 内确认远程设备在线"}
+    processes = app_processes()
+    report["local_work"] = local_work_status(processes)
     for item in checks:
         progress(item["host"] + ("：代理 TLS/HTTP 可达（HTTP " + str(item["http_status"]) + "，不代表已登录）"
                                 if item["reachable"] else "：连接失败，" + item.get("error", "")))
@@ -584,19 +729,26 @@ def run_action(action):
         progress("正在验证独立官方工具进程的 MCP 初始化握手……")
         report["mcp"]["handshake"] = check_mcp()
         write_json(LOGS / "latest-diagnostics.json", report)
-        partial = any(not item["reachable"] for item in checks)
+        partial = any(not item["reachable"] for item in checks) or report["local_work"]["status"] == "failed"
         message = ("部分地址连接失败，请查看日志；官方 MCP 初始化通过。" if partial else "代理连接与官方 MCP 初始化检查通过。")
+        if report["local_work"]["status"] == "failed":
+            message = "代理与 MCP 检查已完成；" + report["local_work"]["message"]
         emit("result", message + "浏览器、Computer Use 和 Remote 的实际会话需在 Codex 中确认。", status="partial" if partial else "checked", report=report)
         return 0
+    progress("正在自动检查当前安装版本的内置插件，并校验 Local Work 所需文件……")
+    bundle = prepare_bundled_resources(app)
+    report["bundled_plugins"] = bundle
+    write_json(LOGS / "latest-diagnostics.json", report)
+    if bundle["resources_path"]:
+        progress("内置插件副本已校验。以后更新时会自动重新识别并准备，无需手动修改版本或路径。")
     progress("正在检查工具代理配置；配置变化前会自动备份……")
     changed = update_config()
     if action == "configure":
         shortcut = install_shortcut()
         emit("result", "已保存代理工具配置并创建桌面“Codex 代理启动”快捷方式。当前 Codex 会话没有重启。", status="configured", shortcut=shortcut, changed=changed)
         return 0
-    processes = app_processes()
     if processes:
-        matched = prior_launch_matches(processes, proxy)
+        matched = prior_launch_matches(processes, proxy, bundle["resources_path"])
         if matched and action != "restart":
             emit("result", "Codex 已通过本启动器运行，代理配置相同。", status="already", pid=matched)
             return 0
@@ -606,8 +758,15 @@ def run_action(action):
         progress("正在请求 Codex 正常退出……")
         close_app(processes)
         app = discover_app(settings)  # Closing can complete an application update.
+        bundle = prepare_bundled_resources(app)
     progress("正在通过代理启动当前安装的 Codex……")
     env = proxy_env(proxy)
+    # Never retain a previous version's resource override from the parent shell.
+    for key in list(env):
+        if key.upper() == BUNDLED_RESOURCES_ENV:
+            del env[key]
+    if bundle["resources_path"]:
+        env[BUNDLED_RESOURCES_ENV] = bundle["resources_path"]
     args = [str(app), "--proxy-server=" + proxy,
             "--proxy-bypass-list=localhost;127.0.0.1;[::1]"]
     child = subprocess.Popen(args, cwd=ROOT, env=env, close_fds=True)
@@ -624,7 +783,21 @@ def run_action(action):
         raise LauncherError("未观察到带代理参数的 Codex 主进程。应用可能正在更新；请等更新结束后重试。")
     main = next((p for p in candidates if p["ProcessId"] == child.pid), candidates[0])
     write_json(STATE / "last-launch.json", {"time": stamp(), "pid": main["ProcessId"],
-              "created": main["Created"], "exe": main["ExecutablePath"], "proxy": proxy})
+              "created": main["Created"], "exe": main["ExecutablePath"], "proxy": proxy,
+              "launcher_version": VERSION, "bundled_plugins_resources": bundle["resources_path"]})
+    progress("Codex 已启动，正在读取本次 Local Work 执行器的连接状态……")
+    deadline = time.monotonic() + 12
+    while True:
+        local_work = local_work_status([main])
+        if local_work["status"] in ("connected", "failed") or time.monotonic() >= deadline:
+            break
+        time.sleep(.5)
+    report.update(codex_exe=str(app), bundled_plugins=bundle, local_work=local_work)
+    write_json(LOGS / "latest-diagnostics.json", report)
+    if local_work["status"] == "failed":
+        emit("result", "Codex 已带代理启动；" + local_work["message"], status="partial", pid=main["ProcessId"], report=report)
+        return 0
+    progress(local_work["message"])
     emit("result", "Codex 已带代理启动。新建工具连接会使用已保存的官方代理启动配置。", status="launched", pid=main["ProcessId"])
     return 0
 

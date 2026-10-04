@@ -1,11 +1,11 @@
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version = '1.0.0',
+    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version = '1.0.1',
     [string]$RuntimeArchive = ''
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $distRoot = Join-Path $repoRoot 'dist'
-$packageRoot = Join-Path $distRoot 'CodexProxyLauncher'
+$packageRoot = Join-Path $distRoot "$Version\CodexProxyLauncher"
 $zipPath = Join-Path $distRoot "codex-proxy-launcher-$Version-windows-x64.zip"
 if ((Test-Path -LiteralPath $packageRoot) -or (Test-Path -LiteralPath $zipPath)) {
     throw 'A package already exists in dist. Use a clean build directory before packaging again.'

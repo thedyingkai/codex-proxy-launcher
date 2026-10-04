@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,111 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("backend", Path(__file__).with_name("backend.py"))
 b = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(b)
+
+
+class LocalWorkTests(unittest.TestCase):
+    def make_app(self, root, version="version-1", supported=True):
+        app = root / version / "app/ChatGPT.exe"
+        app.parent.mkdir(parents=True)
+        app.touch()
+        resources = app.parent / "resources"
+        plugin = resources / "plugins/openai-bundled/plugins/codex-app-tools"
+        (plugin / ".codex-plugin").mkdir(parents=True)
+        (plugin / ".codex-plugin/plugin.json").write_text('{"name":"codex-app-tools"}')
+        (plugin / "server.mjs").write_bytes(b"official fixture\x00\xff")
+        (plugin / ".mcp.json").write_text('{"mcpServers":{}}')
+        script = b.BUNDLED_RESOURCES_ENV.encode() if supported else b"no override in this app"
+        header = json.dumps({"files":{".vite":{"files":{"build":{"files":{
+            "main-test.js":{"offset":"0","size":len(script)}}}}}}}).encode()
+        (resources / "app.asar").write_bytes(struct.pack("<4I", 4, len(header)+8, len(header)+4, len(header))+header+script)
+        return app
+
+    def test_encrypted_plugins_are_copied_identically_and_reused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            app = self.make_app(root)
+            original = b.tree_hashes(b.bundled_plugin_source(app))
+            with patch.object(b, "STATE", root/"state"), patch.object(b, "encrypted_file", return_value=True), patch.object(b, "log"):
+                first = b.prepare_bundled_resources(app)
+                second = b.prepare_bundled_resources(app)
+            self.assertEqual(first["resources_path"], second["resources_path"])
+            self.assertEqual(second["status"], "verified")
+            self.assertEqual(b.tree_hashes(Path(first["resources_path"])/"plugins"), original)
+            self.assertEqual(b.tree_hashes(b.bundled_plugin_source(app)), original)
+            self.assertFalse(any(b.encrypted_file(p) for p in b.regular_tree_files(Path(first["resources_path"])/"plugins")))
+
+    def test_app_update_automatically_selects_new_plugin_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            old_app = self.make_app(root, "old-version")
+            new_app = self.make_app(root, "new-version")
+            new_file = b.bundled_plugin_source(new_app)/"openai-bundled/plugins/codex-app-tools/server.mjs"
+            new_file.write_text("new official version")
+            with patch.object(b, "STATE", root/"state"), patch.object(b, "encrypted_file", return_value=True), patch.object(b, "log"):
+                old = b.prepare_bundled_resources(old_app)
+                new = b.prepare_bundled_resources(new_app)
+            self.assertNotEqual(old["resources_path"], new["resources_path"])
+            self.assertEqual(b.tree_hashes(Path(new["resources_path"])/"plugins"), b.tree_hashes(b.bundled_plugin_source(new_app)))
+            self.assertTrue(Path(old["resources_path"]).is_dir())
+
+    def test_changed_cached_files_are_not_reused_or_overwritten(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            app = self.make_app(root)
+            with patch.object(b, "STATE", root/"state"), patch.object(b, "encrypted_file", return_value=True), patch.object(b, "log"):
+                old = b.prepare_bundled_resources(app)
+                changed = Path(old["resources_path"])/"plugins/openai-bundled/plugins/codex-app-tools/server.mjs"
+                changed.write_text("changed after preparation")
+                new = b.prepare_bundled_resources(app)
+            self.assertNotEqual(old["resources_path"], new["resources_path"])
+            self.assertEqual(changed.read_text(), "changed after preparation")
+            self.assertEqual(b.tree_hashes(Path(new["resources_path"])/"plugins"), b.tree_hashes(b.bundled_plugin_source(app)))
+
+    def test_unsupported_app_does_not_apply_an_unverified_override(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = self.make_app(Path(folder), supported=False)
+            with patch.object(b, "encrypted_file", return_value=True), self.assertRaises(b.LauncherError):
+                b.prepare_bundled_resources(app)
+
+    def test_unencrypted_app_does_not_need_override(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = self.make_app(Path(folder), supported=False)
+            with patch.object(b, "encrypted_file", return_value=False):
+                self.assertIsNone(b.prepare_bundled_resources(app)["resources_path"])
+
+    def test_junction_plugin_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(Path, "is_junction", return_value=True), self.assertRaises(b.LauncherError):
+                b.regular_tree_files(Path(folder))
+
+    def test_old_launch_stamp_requires_restart_after_fix(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            process = {"ProcessId":123,"Created":"timestamp","ExecutablePath":"app.exe",
+                       "CommandLine":"app.exe --proxy-server=http://127.0.0.1:7890"}
+            saved = {"pid":123,"created":"timestamp","exe":"app.exe","proxy":"http://127.0.0.1:7890"}
+            with patch.object(b, "STATE", state):
+                b.write_json(state/"last-launch.json", saved)
+                self.assertIsNone(b.prior_launch_matches([process], saved["proxy"], "new-copy"))
+                saved.update(launcher_version=b.VERSION, bundled_plugins_resources="new-copy")
+                b.write_json(state/"last-launch.json", saved)
+                self.assertEqual(b.prior_launch_matches([process], saved["proxy"], "new-copy"), 123)
+                self.assertIsNone(b.prior_launch_matches([process], saved["proxy"], "updated-copy"))
+
+    def test_diagnostics_distinguish_active_executor_from_old_logs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            day = root/"2026/10/04"
+            day.mkdir(parents=True)
+            (day/"desktop-session-999-t0-i1.log").write_text("2026-10-04T08:00:00.000Z info [tpp-local-executor] Local Work executor connected to rendezvous\n")
+            log = day/"desktop-session-123-t0-i1.log"
+            log.write_text("2026-10-04T08:01:00.000Z warning [tpp-local-executor] Local Work executor startup failed copyfile codex-app-tools\n")
+            failed = b.local_work_status([{"ProcessId":123}], root)
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["reason"], "plugin_copy")
+            with log.open("a") as f:
+                f.write("2026-10-04T08:02:00.000Z info [tpp-local-executor] Local Work executor connected to rendezvous\n")
+            self.assertEqual(b.local_work_status([{"ProcessId":123}], root)["status"], "connected")
 
 
 class ConfigurationTests(unittest.TestCase):

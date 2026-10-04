@@ -156,6 +156,7 @@ namespace CodexProxyLauncher
                 restartNeeded = resultStatus == "running";
                 start.Text = restartNeeded ? "正常关闭并重启" : "配置并启动";
                 if (restartNeeded) status.ForeColor = Color.FromArgb(170, 105, 20);
+                if (resultStatus == "partial") status.ForeColor = Color.FromArgb(179, 63, 43);
                 if (resultStatus == "launched" || resultStatus == "already")
                 {
                     try { var p = Process.GetProcessById(appPid); ShowWindow(p.MainWindowHandle, 9); SetForegroundWindow(p.MainWindowHandle); } catch { }
